@@ -1,0 +1,11 @@
+--- a/dist/lsDefaults.js
++++ b/dist/lsDefaults.js
+@@ -9,7 +9,7 @@
+     return [
+         '--standalone',
+         '--override_ide_name',
+-        'antigravity',
++        opts.overrideIdeName || 'antigravity',
+         '--subclient_type',
+         'hub',
+         '--override_ide_version',

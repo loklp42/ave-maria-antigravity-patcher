@@ -1,0 +1,471 @@
+--- a/dist/main.js
++++ b/dist/main.js
+@@ -80,6 +80,19 @@
+ const previewIpc_1 = require("./computer/previewIpc");
+ const captureWindow_1 = require("./browserStream/captureWindow");
+ const browserViewerHandler_1 = require("./browserStream/browserViewerHandler");
++const agyTabManager = require("./agyTabManager");
++// Isolate Electron userData ONLY when explicitly launched with --agy-profile=<id> for a separate parallel window
++const _agyCliProfile = (electron_1.app?.commandLine?.getSwitchValue?.('agy-profile') || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
++if (_agyCliProfile && _agyCliProfile !== 'default') {
++    const _profUserData = path.join(electron_1.app.getPath('appData'), 'Antigravity-Profiles', _agyCliProfile);
++    try {
++        fs.mkdirSync(_profUserData, { recursive: true });
++    }
++    catch {
++        // ignore
++    }
++    electron_1.app.setPath('userData', _profUserData);
++}
+ const gotTheLock = electron_1.app.requestSingleInstanceLock();
+ if (!gotTheLock) {
+     electron_1.app.quit();
+@@ -209,6 +222,25 @@
+     if ((0, signInReturn_1.isOAuthSuccessLink)(url, PROTOCOL)) {
+         void mendelFlagSync?.refresh();
+     }
++    if (agyTabManager.hasMainWindow()) {
++        const mw = agyTabManager.getMainWindow();
++        if (mw.isMinimized()) mw.restore();
++        mw.show();
++        mw.focus();
++        electron_1.app.focus({ steal: true });
++        const activeId = agyTabManager.getActiveAccountId();
++        const activeWc = activeId ? agyTabManager.getTabWebContents(activeId) : null;
++        if (activeWc && !activeWc.isDestroyed?.() && activeWc.getURL() && !activeWc.isLoadingMainFrame?.()) {
++            activeWc.send('deep-link', url);
++        }
++        else {
++            pendingDeepLink = url;
++            if (!activeId) {
++                void agyTabManager.openOrActivateAccount('default');
++            }
++        }
++        return;
++    }
+     // Deep links can carry auth codes: never to an SSH window.
+     const wins = (0, utils_1.getLocalHubWindows)();
+     // This block handles deep links when windows are already open.
+@@ -266,7 +298,15 @@
+         return;
+     }
+     if (!HEADLESS && hasStartedMainApplication) {
+-        (0, utils_1.showOrCreateWindow)((0, languageServer_1.getLsPort)());
++        if (agyTabManager.hasMainWindow()) {
++            const mw = agyTabManager.getMainWindow();
++            if (mw.isMinimized()) mw.restore();
++            mw.show();
++            mw.focus();
++        }
++        else {
++            void agyTabManager.createMainTabWindow(storageManager);
++        }
+         electron_1.app.focus({ steal: true });
+     }
+     if (url) {
+@@ -543,12 +583,171 @@
+         // Non-fatal: the app is still usable, the LS just can't drive updates.
+         console.error('Failed to start host bridge server:', err.message);
+     }
++    if (isQuitting) {
++        return;
++    }
++    const syncBrowserViewerRegistration = (syncPresence = false) => {
++        if (isQuitting) {
++            return;
++        }
++        const items = typeof storageManager?.getItemsSync === 'function'
++            ? storageManager.getItemsSync()
++            : undefined;
++        const enabled = (0, mendelFlagSync_1.evaluateRemoteControlBrowserStreamEnabled)(items, process.env, Boolean(electron_1.app.isPackaged));
++        if (enabled && !browserViewerRegistered) {
++            browserViewerRegistered = true;
++            (0, browserViewerHandler_1.registerBrowserViewer)();
++            if (syncPresence) {
++                (0, browserViewerHandler_1.syncBrowserViewerHostPresence)();
++            }
++        }
++        else if (!enabled && browserViewerRegistered) {
++            browserViewerRegistered = false;
++            void (0, browserViewerHandler_1.unregisterBrowserViewer)().catch(() => undefined);
++            (0, captureWindow_1.disposeCaptureWindow)();
++        }
++    };
++    browserViewerStorageSub?.dispose();
++    browserViewerStorageSub = storageManager.onDidChange?.((changes) => {
++        if (constants_1.RC_BROWSER_STREAM_FLAG in changes ||
++            constants_1.CUSTOM_FLAG_OVERRIDES_STORAGE_KEY in changes) {
++            syncBrowserViewerRegistration(true);
++        }
++    });
++    if (computerUseOn) {
++        (0, computer_1.registerComputerUse)({ headless: HEADLESS }); // `computer` actuator
++    }
++    syncBrowserViewerRegistration(false);
++    // Desktop multi-account tabbed mode: start directly into single BaseWindow Account Picker (<100ms)
++    // and launch each account's isolated language_server.exe lazily when selected.
++    if (!HEADLESS) {
++        (0, languageServer_1.setupLocalCertTrust)();
++        (0, languageServer_1.configureLanguageServerPool)({
++            headless: false,
++            wsl: wslOptions,
++            hostBridgeUrl: hostBridgeServer?.url,
++            hostBridgeToken: hostBridgeServer?.token,
++            onInstancePortChanged: (profileKey, newPort, newCsrf) => {
++                agyTabManager.handleInstancePortChanged(profileKey, newPort, newCsrf);
++            },
++            onInstanceExited: (profileKey) => {
++                agyTabManager.handleInstanceExited(profileKey);
++            },
++        });
++        agyTabManager.setActiveLsChangedCallback((_accId, port, activeCsrf) => {
++            if (!mendelFlagSync) {
++                mendelFlagSync = (0, mendelFlagSync_1.startMendelFlagSync)({
++                    port,
++                    csrfToken: activeCsrf,
++                    storageManager,
++                });
++            }
++            else {
++                mendelFlagSync.onPortChanged(port);
++            }
++            if (browserViewerRegistered) {
++                (0, browserViewerHandler_1.syncBrowserViewerHostPresence)();
++            }
++        });
++        console.log('\n' + '='.repeat(60));
++        console.log('  Mode:          Multi-Account Tabbed Window (Account Picker)');
++        console.log(`  LS Logs:       ${(0, paths_1.getLsLogPath)()}`);
++        console.log(`  Electron Logs: ${main_1.default.transports.file.getFile().path}`);
++        console.log('='.repeat(60) + '\n');
++        (0, menu_1.setupApplicationMenu)(`${constants_1.WINDOW_ORIGIN}:0/`);
++        await agyTabManager.createMainTabWindow(storageManager);
++        if (_agyCliProfile) {
++            void agyTabManager.openOrActivateAccount(_agyCliProfile);
++        }
++        else if (pendingDeepLink) {
++            void agyTabManager.openOrActivateAccount('default');
++        }
++        else {
++            try {
++                const wpCfg = typeof wallpaperEngine.readAppearanceConfig === 'function'
++                    ? wallpaperEngine.readAppearanceConfig()
++                    : {};
++                const startupMode = wpCfg.accountStartupMode || 'picker';
++                const accounts = typeof agyAccounts.loadAccounts === 'function'
++                    ? agyAccounts.loadAccounts()
++                    : [];
++                if (startupMode === 'primary' && wpCfg.primaryAccountId) {
++                    const target = accounts.find((a) => a.id === wpCfg.primaryAccountId);
++                    if (target) void agyTabManager.openOrActivateAccount(target.id);
++                }
++                else if (startupMode === 'last' && accounts.length > 0) {
++                    const sorted = [...accounts].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
++                    if (sorted[0]?.id) void agyTabManager.openOrActivateAccount(sorted[0].id);
++                }
++            } catch {}
++        }
++        if (electron_1.app.dock) {
++            const dockMenu = electron_1.Menu.buildFromTemplate([
++                {
++                    label: 'Accounts',
++                    click: () => {
++                        void agyTabManager.createMainTabWindow(storageManager).then(() => agyTabManager.showPicker());
++                    },
++                },
++            ]);
++            electron_1.app.dock.setMenu(dockMenu);
++        }
++        const focusMainTabbedWindow = () => {
++            if (agyTabManager.hasMainWindow()) {
++                const mw = agyTabManager.getMainWindow();
++                if (mw.isMinimized()) mw.restore();
++                mw.show();
++                mw.focus();
++            }
++            else {
++                void agyTabManager.createMainTabWindow(storageManager);
++            }
++        };
++        (0, tray_1.createTray)([
++            {
++                id: 'running-agents',
++                label: 'No agents running',
++                enabled: false,
++            },
++            { type: 'separator' },
++            {
++                label: `Open ${electron_1.app.getName()}`,
++                click: () => focusMainTabbedWindow(),
++            },
++            {
++                label: 'Account Picker',
++                click: () => {
++                    focusMainTabbedWindow();
++                    agyTabManager.showPicker();
++                },
++            },
++            {
++                label: 'Quit',
++                click: () => {
++                    electron_1.app.quit();
++                },
++            },
++        ], () => {
++            focusMainTabbedWindow();
++            electron_1.app.focus({ steal: true });
++        });
++        void (0, menu_1.wslConnectMenuTemplate)().then((wslItem) => {
++            if (wslItem) {
++                (0, tray_1.insertTrayMenuItem)(2, wslItem);
++                const reopen = (0, menu_1.wslReopenLocallyTemplate)();
++                if (reopen) {
++                    (0, tray_1.insertTrayMenuItem)(3, reopen);
++                }
++            }
++        });
++        openStartupSshWindows();
++        (0, updater_1.initAutoUpdater)(HEADLESS, settingsService);
++        hasStartedMainApplication = true;
++        return;
++    }
+     let handle;
+     let lsExited = false;
+     const targetPort = Number(process.env.JETSKI_LS_PORT) || constants_1.DYNAMIC_PORT;
+-    if (isQuitting) {
+-        return;
+-    }
+     try {
+         handle = await (0, languageServer_1.startAndMonitorLanguageServer)(targetPort, csrf, {
+             headless: HEADLESS,
+@@ -566,29 +765,8 @@
+                 void (0, browserViewerHandler_1.resetBrowserViewerSessions)();
+                 (0, captureWindow_1.disposeCaptureWindow)();
+                 mendelFlagSync?.onPortChanged(newPort);
+-                const newBaseUrl = `${constants_1.WINDOW_ORIGIN}:${newPort}`;
+-                console.log(`[Auto-Restart] Port changed! Reloading all windows with URL: ${newBaseUrl}/`);
+-                // Apply cert trust
+                 (0, languageServer_1.setupLocalCertTrust)();
+-                // Main-process ActuatorService streams follow the LS to its new port.
+                 (0, mainClient_1.mainActuatorClientPortChanged)(newPort);
+-                if (!HEADLESS) {
+-                    // Hub windows only: the desktop HUD and SSH windows keep their own pages.
+-                    const windows = (0, utils_1.getLocalHubWindows)();
+-                    if (windows.length === 0 && pendingDeepLink !== null) {
+-                        (0, utils_1.createWindow)(`${newBaseUrl}/`, storageManager);
+-                        electron_1.app.focus({ steal: true });
+-                    }
+-                    else {
+-                        for (const win of windows) {
+-                            const currentUrl = (0, utils_1.getHubWebContents)(win)?.getURL?.();
+-                            const targetUrl = (0, authBootstrap_1.buildLsRestartWindowUrl)(currentUrl, newBaseUrl);
+-                            if (targetUrl) {
+-                                void (0, utils_1.loadHubWindowUrl)(win, targetUrl);
+-                            }
+-                        }
+-                    }
+-                }
+             },
+         });
+     }
+@@ -596,136 +774,37 @@
+         if (isQuitting) {
+             return;
+         }
+-        const msg = err.message;
+-        if (HEADLESS) {
+-            console.error('Startup failed:', msg);
+-        }
+-        else {
+-            await electron_1.dialog.showErrorBox('Startup failed', msg);
+-        }
++        console.error('Startup failed:', err.message);
+         electron_1.app.quit();
+         return;
+     }
+-    const syncBrowserViewerRegistration = (syncPresence = false) => {
+-        if (isQuitting) {
+-            return;
+-        }
+-        const items = typeof storageManager?.getItemsSync === 'function'
+-            ? storageManager.getItemsSync()
+-            : undefined;
+-        const enabled = (0, mendelFlagSync_1.evaluateRemoteControlBrowserStreamEnabled)(items, process.env, Boolean(electron_1.app.isPackaged));
+-        if (enabled && !browserViewerRegistered) {
+-            browserViewerRegistered = true;
+-            (0, browserViewerHandler_1.registerBrowserViewer)();
+-            if (syncPresence) {
+-                (0, browserViewerHandler_1.syncBrowserViewerHostPresence)();
+-            }
+-        }
+-        else if (!enabled && browserViewerRegistered) {
+-            browserViewerRegistered = false;
+-            void (0, browserViewerHandler_1.unregisterBrowserViewer)().catch(() => undefined);
+-            (0, captureWindow_1.disposeCaptureWindow)();
+-        }
+-    };
+     mendelFlagSync = (0, mendelFlagSync_1.startMendelFlagSync)({
+         port: lsExited ? 0 : handle.port,
+         csrfToken: csrf,
+         storageManager,
+     });
+-    browserViewerStorageSub?.dispose();
+-    browserViewerStorageSub = storageManager.onDidChange?.((changes) => {
+-        if (constants_1.RC_BROWSER_STREAM_FLAG in changes ||
+-            constants_1.CUSTOM_FLAG_OVERRIDES_STORAGE_KEY in changes) {
+-            syncBrowserViewerRegistration(true);
+-        }
+-    });
+     const url = `${constants_1.WINDOW_ORIGIN}:${handle.port}/`;
+-    // Main-process ActuatorClient (actuator types hosted by the main process
+-    // register on it); it dials the LS's ActuatorService from here on.
+-    if (computerUseOn) {
+-        (0, computer_1.registerComputerUse)({ headless: HEADLESS }); // `computer` actuator
+-    }
+-    syncBrowserViewerRegistration(false);
+     (0, mainClient_1.startMainActuatorClient)(handle.port, csrf);
+     console.log('\n' + '='.repeat(60));
+     console.log(`  Local:       ${url}`);
+     console.log(`  LS Logs:     ${(0, paths_1.getLsLogPath)()}`);
+     console.log(`  Electron Logs: ${main_1.default.transports.file.getFile().path}`);
+     console.log('='.repeat(60) + '\n');
+-    if (HEADLESS) {
+-        // In headless mode, forward stdin to the Language Server to allow interaction via terminal.
+-        const rl = readline.createInterface({
+-            input: process.stdin,
+-            output: process.stdout,
+-        });
+-        rl.on('line', (line) => {
+-            const lsProc = (0, languageServer_1.getLsProcess)();
+-            if (lsProc && lsProc.stdin) {
+-                lsProc.stdin.write(line + '\n');
+-                console.log('-> Forwarded input to Language Server.');
+-            }
+-            else {
+-                console.log('Language Server process is not running.');
+-            }
+-        });
+-    }
+-    // Initial window — opened once after the LS has successfully started.
+-    if (!HEADLESS) {
+-        (0, menu_1.setupApplicationMenu)(url);
+-        (0, utils_1.createWindow)(url, storageManager);
+-        if (browserViewerRegistered) {
+-            (0, browserViewerHandler_1.syncBrowserViewerHostPresence)();
+-        }
+-        if (electron_1.app.dock) {
+-            const dockMenu = electron_1.Menu.buildFromTemplate([
+-                {
+-                    label: 'New Window',
+-                    click: () => {
+-                        const entryUrl = resolveLocalHubEntryUrl();
+-                        if (entryUrl) {
+-                            (0, utils_1.createWindow)(entryUrl, storageManager, {
+-                                cascade: true,
+-                            });
+-                        }
+-                    },
+-                },
+-            ]);
+-            electron_1.app.dock.setMenu(dockMenu);
+-        }
+-        (0, tray_1.createTray)([
+-            {
+-                id: 'running-agents',
+-                label: 'No agents running',
+-                enabled: false,
+-            },
+-            { type: 'separator' },
+-            {
+-                label: `Open ${electron_1.app.getName()}`,
+-                click: () => (0, utils_1.showOrCreateWindow)((0, languageServer_1.getLsPort)()),
+-            },
+-            {
+-                label: 'Quit',
+-                click: () => {
+-                    // Triggers 'before-quit' to run graceful cleanup without confirmation.
+-                    electron_1.app.quit();
+-                },
+-            },
+-        ], () => {
+-            (0, utils_1.showOrCreateWindow)((0, languageServer_1.getLsPort)());
+-            electron_1.app.focus({ steal: true });
+-        });
+-        // The app menu bar isn't reachable on Windows (hidden title bar), so
+-        // the tray menu also gets the "Connect to WSL" entry.
+-        void (0, menu_1.wslConnectMenuTemplate)().then((wslItem) => {
+-            if (wslItem) {
+-                (0, tray_1.insertTrayMenuItem)(2, wslItem);
+-                const reopen = (0, menu_1.wslReopenLocallyTemplate)();
+-                if (reopen) {
+-                    (0, tray_1.insertTrayMenuItem)(3, reopen);
+-                }
+-            }
+-        });
+-    }
++    // In headless mode, forward stdin to the Language Server to allow interaction via terminal.
++    const rl = readline.createInterface({
++        input: process.stdin,
++        output: process.stdout,
++    });
++    rl.on('line', (line) => {
++        const lsProc = (0, languageServer_1.getLsProcess)();
++        if (lsProc && lsProc.stdin) {
++            lsProc.stdin.write(line + '\n');
++            console.log('-> Forwarded input to Language Server.');
++        }
++        else {
++            console.log('Language Server process is not running.');
++        }
++    });
+     openStartupSshWindows();
+     // Start checking for app updates.
+     (0, updater_1.initAutoUpdater)(HEADLESS, settingsService);
+@@ -785,19 +864,33 @@
+         (0, captureWindow_1.disposeCaptureWindow)();
+         // Persist the focused/open Hub window bounds and full-screen/maximized state
+         // before `win.destroy()`, which bypasses the normal `'close'` event.
+-        (0, windowState_1.flushTrackedWindowState)((0, utils_1.getFocusedHubWindow)());
++        try {
++            (0, windowState_1.flushTrackedWindowState)((0, utils_1.getFocusedHubWindow)());
++        } catch {}
+         // Before the windows close: the SSH windows open now reopen next time.
+         sshWindows?.freeze();
+         // Before destroying the windows (see disposeAll).
+         const sshClosed = remoteManager?.disposeAll().catch((err) => {
+             console.error('Failed to close SSH connections:', err);
+         }) ?? Promise.resolve();
++        // Cleanly detach and close all WebContentsView tabs/shell views before BaseWindow.destroy()
++        try {
++            agyTabManager.closeAllViewsForQuit?.();
++        } catch {}
+         // Destroy all windows to terminate renderers and release keep-alive sockets
+         const windows = [
+-            ...new Set([...(0, utils_1.getHubWindows)(), ...electron_1.BrowserWindow.getAllWindows()]),
++            ...new Set([
++                ...(0, utils_1.getHubWindows)(),
++                ...(typeof electron_1.BaseWindow?.getAllWindows === 'function' ? electron_1.BaseWindow.getAllWindows() : []),
++                ...electron_1.BrowserWindow.getAllWindows(),
++            ]),
+         ];
+         for (const win of windows) {
+-            win.destroy();
++            try {
++                if (win && !win.isDestroyed?.()) {
++                    win.destroy();
++                }
++            } catch {}
+         }
+         // Tell the LS this process's actuators are going away (GOING_AWAY per
+         // actuator type) while it is still up; bounded so quitting never hangs.
+@@ -874,9 +967,6 @@
+     // On Mac, re-open a window when the user clicks the dock
+     // icon and no windows are open.
+     if (!HEADLESS && (0, utils_1.getHubWindows)().length === 0) {
+-        const entryUrl = resolveLocalHubEntryUrl();
+-        if (entryUrl) {
+-            (0, utils_1.createWindow)(entryUrl, storageManager);
+-        }
++        void agyTabManager.createMainTabWindow(storageManager);
+     }
+ });

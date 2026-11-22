@@ -1,0 +1,103 @@
+--- a/dist/customScheme.js
++++ b/dist/customScheme.js
+@@ -4,9 +4,11 @@
+ exports.registerCustomSchemes = registerCustomSchemes;
+ exports.handleFaviconProtocolRequest = handleFaviconProtocolRequest;
+ exports.registerCustomSchemeHandlers = registerCustomSchemeHandlers;
++exports.registerCustomSchemeHandlersForSession = registerCustomSchemeHandlersForSession;
+ const electron_1 = require("electron");
+ const faviconStore_1 = require("./faviconStore");
+ const redirects_1 = require("./redirects");
++const wallpaperEngine_1 = require("./wallpaperEngine");
+ exports.BROWSER_STREAM_SCHEME = 'agy-browser-stream';
+ // A map of extension authority -> original URL (http://localhost:<port>)
+ // The authority is usually a hash of unique extension identifiers
+@@ -39,6 +41,7 @@
+             privileges: { standard: true, secure: true },
+         },
+     ]);
++    (0, wallpaperEngine_1.registerWallpaperScheme)();
+ }
+ /**
+  * Handles `agy-favicon://<token>/` by looking the token up in the favicon
+@@ -70,34 +73,55 @@
+         },
+     });
+ }
++async function handlePluginProtocolRequest(request) {
++    const url = new URL(request.url);
++    const authority = url.hostname;
++    const originalHost = exports.extensionAuthorities.get(authority);
++    if (!originalHost) {
++        return new Response(null, { status: 404 });
++    }
++    // Origin plus path: resolving a path like "//host/x" against the sidecar
++    // URL would switch to another host.
++    const sidecar = new URL(originalHost);
++    const targetUrl = new URL(`${sidecar.origin}${url.pathname}${url.search}`);
++    if (targetUrl.host !== sidecar.host) {
++        return new Response(null, { status: 404 });
++    }
++    try {
++        // With the main process's network and cookies. A redirect goes back to
++        // the frame if it stays on the sidecar's origin (redirects.ts).
++        const response = await (0, redirects_1.fetchWithoutFollowing)(targetUrl.href, request);
++        return (0, redirects_1.pluginResponse)(response, targetUrl, url);
++    }
++    catch (err) {
++        console.error(`Failed to proxy request to ${targetUrl}:`, err);
++        return new Response(null, { status: 500 });
++    }
++}
++const registeredSchemeSessions = new WeakSet();
++function registerCustomSchemeHandlersForSession(targetSession) {
++    if (!targetSession || registeredSchemeSessions.has(targetSession)) {
++        return;
++    }
++    registeredSchemeSessions.add(targetSession);
++    try {
++        if (!targetSession.protocol.isProtocolHandled('plugin')) {
++            targetSession.protocol.handle('plugin', handlePluginProtocolRequest);
++        }
++    }
++    catch {}
++    try {
++        if (!targetSession.protocol.isProtocolHandled(faviconStore_1.FAVICON_SCHEME)) {
++            targetSession.protocol.handle(faviconStore_1.FAVICON_SCHEME, handleFaviconProtocolRequest);
++        }
++    }
++    catch {}
++}
+ function registerCustomSchemeHandlers() {
+     // Handle custom scheme for UI extensions
+-    electron_1.protocol.handle('plugin', async (request) => {
+-        const url = new URL(request.url);
+-        const authority = url.hostname;
+-        const originalHost = exports.extensionAuthorities.get(authority);
+-        if (!originalHost) {
+-            return new Response(null, { status: 404 });
+-        }
+-        // Origin plus path: resolving a path like "//host/x" against the sidecar
+-        // URL would switch to another host.
+-        const sidecar = new URL(originalHost);
+-        const targetUrl = new URL(`${sidecar.origin}${url.pathname}${url.search}`);
+-        if (targetUrl.host !== sidecar.host) {
+-            return new Response(null, { status: 404 });
+-        }
+-        try {
+-            // With the main process's network and cookies. A redirect goes back to
+-            // the frame if it stays on the sidecar's origin (redirects.ts).
+-            const response = await (0, redirects_1.fetchWithoutFollowing)(targetUrl.href, request);
+-            return (0, redirects_1.pluginResponse)(response, targetUrl, url);
+-        }
+-        catch (err) {
+-            console.error(`Failed to proxy request to ${targetUrl}:`, err);
+-            return new Response(null, { status: 500 });
+-        }
+-    });
++    electron_1.protocol.handle('plugin', handlePluginProtocolRequest);
+     // Module-level `protocol` binds to the default session only: the Hub
+     // renderer's session, never a guest partition.
+     electron_1.protocol.handle(faviconStore_1.FAVICON_SCHEME, handleFaviconProtocolRequest);
++    (0, wallpaperEngine_1.registerWallpaperProtocol)();
+ }

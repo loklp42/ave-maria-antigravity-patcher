@@ -1,0 +1,32 @@
+--- a/dist/authBootstrap.js
++++ b/dist/authBootstrap.js
+@@ -39,6 +39,7 @@
+ exports.getActiveLsCsrfToken = getActiveLsCsrfToken;
+ exports.getActiveLsBaseUrl = getActiveLsBaseUrl;
+ exports.mintActiveLsBootstrapToken = mintActiveLsBootstrapToken;
++exports.mintBootstrapTokenForInstance = mintBootstrapTokenForInstance;
+ exports.isLoopbackHostname = isLoopbackHostname;
+ exports.mintBootstrapToken = mintBootstrapToken;
+ exports.mintBootstrapTokenWithRetry = mintBootstrapTokenWithRetry;
+@@ -91,14 +92,17 @@
+  * immediately on the first response.
+  */
+ async function mintActiveLsBootstrapToken() {
+-    const serverBaseUrl = getActiveLsBaseUrl();
+-    const csrfToken = _activeLsCsrfToken || undefined;
+-    if (!serverBaseUrl || !csrfToken) {
++    return mintBootstrapTokenForInstance(_activeLsPort, _activeLsCsrfToken);
++}
++async function mintBootstrapTokenForInstance(port, csrfToken) {
++    const serverBaseUrl = port > 0 ? `${constants_1.WINDOW_ORIGIN}:${port}` : undefined;
++    const token = csrfToken || undefined;
++    if (!serverBaseUrl || !token) {
+         return undefined;
+     }
+     return mintBootstrapTokenWithRetry({
+         serverBaseUrl,
+-        csrfToken,
++        csrfToken: token,
+         attemptTimeoutMs: exports.ACTIVE_LS_MINT_ATTEMPT_TIMEOUT_MS,
+         maxWaitMs: exports.ACTIVE_LS_MINT_MAX_WAIT_MS,
+         retryDelayMs: exports.ACTIVE_LS_MINT_RETRY_DELAY_MS,

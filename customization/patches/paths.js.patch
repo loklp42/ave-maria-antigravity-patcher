@@ -1,0 +1,181 @@
+--- a/dist/paths.js
++++ b/dist/paths.js
+@@ -37,6 +37,14 @@
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.IDE_BACKUP_DATA_DIR = exports.IDE_NEW_DATA_DIR = exports.IDE_OLD_DATA_DIR = void 0;
++exports.getActiveProfileName = getActiveProfileName;
++exports.setActiveProfileName = setActiveProfileName;
++exports.getGeminiDirForProfile = getGeminiDirForProfile;
++exports.getAppDataDirForProfile = getAppDataDirForProfile;
++exports.getSharedConfigDir = getSharedConfigDir;
++exports.isGeminiProfileReady = isGeminiProfileReady;
++exports.getOverrideIdeName = getOverrideIdeName;
++exports.getGeminiDir = getGeminiDir;
+ exports.getAppDataDirName = getAppDataDirName;
+ exports.getAppDataDir = getAppDataDir;
+ exports.getSettingsPbPath = getSettingsPbPath;
+@@ -51,6 +59,135 @@
+ const path_1 = __importDefault(require("path"));
+ const os_1 = __importDefault(require("os"));
+ const constants_1 = require("./constants");
++let _runtimeProfileOverride = null;
++function getActiveProfileFilePath() {
++    try {
++        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
++        return path_1.default.join(appData, 'agy_active_profile.json');
++    }
++    catch {
++        return '';
++    }
++}
++function sanitizeProfileId(raw) {
++    const clean = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
++    return clean && clean !== 'default' ? clean : '';
++}
++function setActiveProfileName(profileId, persist = true) {
++    const clean = sanitizeProfileId(profileId);
++    _runtimeProfileOverride = clean;
++    if (persist) {
++        try {
++            const fp = getActiveProfileFilePath();
++            if (fp) {
++                fs.writeFileSync(fp, JSON.stringify({ activeProfile: clean || 'default' }, null, 2), 'utf8');
++            }
++        }
++        catch {
++            // ignore
++        }
++    }
++    return clean;
++}
++function getActiveProfileName() {
++    if (_runtimeProfileOverride !== null) {
++        return _runtimeProfileOverride;
++    }
++    try {
++        const sw = electron_1.app?.commandLine?.getSwitchValue?.('agy-profile');
++        if (sw && sw.trim()) {
++            const clean = sanitizeProfileId(sw);
++            _runtimeProfileOverride = clean;
++            return clean;
++        }
++    }
++    catch {
++        // ignore
++    }
++    if (process.env.AGY_PROFILE && process.env.AGY_PROFILE.trim()) {
++        const clean = sanitizeProfileId(process.env.AGY_PROFILE);
++        _runtimeProfileOverride = clean;
++        return clean;
++    }
++    try {
++        const fp = getActiveProfileFilePath();
++        if (fp && fs.existsSync(fp)) {
++            const parsed = JSON.parse(fs.readFileSync(fp, 'utf8'));
++            const clean = sanitizeProfileId(parsed?.activeProfile);
++            _runtimeProfileOverride = clean;
++            return clean;
++        }
++    }
++    catch {
++        // ignore
++    }
++    _runtimeProfileOverride = '';
++    return '';
++}
++function getOverrideIdeName() {
++    // Must always remain 'antigravity' so language_server runs in antigravity-hub mode
++    // and supports interactive Google OAuth login across all profiles.
++    return 'antigravity';
++}
++function normalizeProfilePathId(raw) {
++    const requested = String(raw ?? '').trim().toLowerCase();
++    if (!requested || requested === 'default') {
++        return '';
++    }
++    return /^[a-z0-9_-]+$/.test(requested) ? requested : null;
++}
++function getSharedConfigDir() {
++    try {
++        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
++        return path_1.default.join(appData, 'Antigravity');
++    }
++    catch {
++        return electron_1.app?.getPath?.('userData') || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming', 'Antigravity');
++    }
++}
++function getGeminiDirForProfile(profileId, explicitDir) {
++    if (typeof explicitDir === 'string' && explicitDir.trim()) {
++        return explicitDir.trim();
++    }
++    const profile = normalizeProfilePathId(profileId);
++    if (profile === null) {
++        return '';
++    }
++    if (!profile) {
++        return path_1.default.join(os_1.default.homedir(), '.gemini');
++    }
++    if (process.platform === 'win32') {
++        const isolated = path_1.default.join('C:\\ProgramData\\AntigravityAccounts', profile, '.gemini');
++        if (fs.existsSync(isolated)) {
++            return isolated;
++        }
++    }
++    return path_1.default.join(os_1.default.homedir(), '.gemini-profiles', profile);
++}
++function getAppDataDirForProfile(profileId, explicitGeminiDir) {
++    const gDir = getGeminiDirForProfile(profileId, explicitGeminiDir) || path_1.default.join(os_1.default.homedir(), '.gemini');
++    return path_1.default.join(gDir, getAppDataDirName());
++}
++function isGeminiProfileReady(profileId) {
++    const profile = normalizeProfilePathId(profileId);
++    if (profile === null) {
++        return false;
++    }
++    if (!profile) {
++        return true;
++    }
++    const profileDir = getGeminiDirForProfile(profile);
++    try {
++        return fs.statSync(profileDir).isDirectory() && fs.readdirSync(profileDir).length > 0;
++    }
++    catch {
++        return false;
++    }
++}
++function getGeminiDir() {
++    const profile = getActiveProfileName();
++    return getGeminiDirForProfile(profile) || path_1.default.join(os_1.default.homedir(), '.gemini');
++}
+ function getAppDataDirName() {
+     if (!electron_1.app.isPackaged) {
+         return 'antigravity-dev';
+@@ -58,10 +195,10 @@
+     return electron_1.app.getName().toLowerCase().replace(/\s+/g, '');
+ }
+ function getAppDataDir() {
+-    return path_1.default.join(os_1.default.homedir(), '.gemini', getAppDataDirName());
++    return path_1.default.join(getGeminiDir(), getAppDataDirName());
+ }
+ function getSettingsPbPath() {
+-    return path_1.default.join(os_1.default.homedir(), '.gemini', 'config', 'config.json');
++    return path_1.default.join(getGeminiDir(), 'config', 'config.json');
+ }
+ /**
+  * Returns the path to the persistent app storage file.
+@@ -128,8 +265,12 @@
+         // Missing file, foreign filesystem, or partial fs mock: leave as is.
+     }
+ }
+-function getLsLogPath() {
+-    return path_1.default.join(electron_1.app.getPath('logs'), constants_1.LS_LOG_FILE_NAME);
++function getLsLogPath(profileId) {
++    const prof = profileId !== undefined ? sanitizeProfileId(profileId) : getActiveProfileName();
++    const fileName = prof
++        ? constants_1.LS_LOG_FILE_NAME.replace(/(\.[^.]+)?$/, `_${prof}$1`)
++        : constants_1.LS_LOG_FILE_NAME;
++    return path_1.default.join(electron_1.app.getPath('logs'), fileName);
+ }
+ /** User data dir for the old IDE (source for copy). */
+ exports.IDE_OLD_DATA_DIR = path_1.default.join(os_1.default.homedir(), '.gemini', 'antigravity');

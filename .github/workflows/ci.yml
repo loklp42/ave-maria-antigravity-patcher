@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Python core & sanitization tests
+        run: python tests/run_all_tests.py
+
+      - name: Run JS module & runtime smoke tests
+        run: node tests/test_modules_behavior.js
+
+      - name: Build Patcher Frontend (TypeScript + Vite)
+        working-directory: patcher
+        run: |
+          npm ci
+          npm run build

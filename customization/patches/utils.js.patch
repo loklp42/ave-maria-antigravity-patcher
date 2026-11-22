@@ -1,0 +1,178 @@
+--- a/dist/utils.js
++++ b/dist/utils.js
+@@ -61,6 +61,14 @@
+ exports.setHubSurfaceTransparent = setHubSurfaceTransparent;
+ exports.isHubSurfaceTransparent = isHubSurfaceTransparent;
+ exports.getHubWebContents = getHubWebContents;
++exports.getAllHubWebContents = getAllHubWebContents;
++exports.registerTabHostWindow = registerTabHostWindow;
++exports.isTabHostWindow = isTabHostWindow;
++exports.setActiveHubViewForWindow = setActiveHubViewForWindow;
++exports.registerAccountTabWebContents = registerAccountTabWebContents;
++exports.isRegisteredAccountTabWebContents = isRegisteredAccountTabWebContents;
++exports.getTabBarHeightForWindow = getTabBarHeightForWindow;
++exports.setTabBarHeightForWindow = setTabBarHeightForWindow;
+ exports.resolveHubWindowFromWebContents = resolveHubWindowFromWebContents;
+ exports.resolveHubWindowFromCatcherWebContents = resolveHubWindowFromCatcherWebContents;
+ exports.getHubWindows = getHubWindows;
+@@ -233,6 +241,107 @@
+ const bootstrappingWindows = new WeakSet();
+ const expectedOriginByWindow = new WeakMap();
+ const navigationSeqByWindow = new WeakMap();
++const tabHostWindows = new WeakSet();
++const tabBarHeightByWindow = new WeakMap();
++const accountTabWebContentsByWindow = new WeakMap();
++const accountTabWebContentsSet = new WeakSet();
++function isTabHostWindow(win) {
++    return Boolean(win && typeof win === 'object' && tabHostWindows.has(win));
++}
++function getTabBarHeightForWindow(win) {
++    return (win && typeof win === 'object' ? tabBarHeightByWindow.get(win) : 0) || 0;
++}
++function setTabBarHeightForWindow(win, height) {
++    if (win && typeof win === 'object' && Number.isFinite(height) && height >= 0) {
++        tabBarHeightByWindow.set(win, Math.round(height));
++    }
++}
++function registerTabHostWindow(win, opts = {}) {
++    if (!win || typeof win !== 'object') {
++        return;
++    }
++    hubWindows.add(win);
++    tabHostWindows.add(win);
++    accountTabWebContentsByWindow.set(win, new Set());
++    if (opts.initialView) {
++        hubViewByWindow.set(win, opts.initialView);
++    }
++    if (opts.curtainView) {
++        hubCurtainViewByWindow.set(win, opts.curtainView);
++    }
++    if (opts.curtainColor) {
++        hubCurtainColorByWindow.set(win, opts.curtainColor);
++    }
++    if (typeof opts.tabBarHeight === 'number') {
++        tabBarHeightByWindow.set(win, Math.round(opts.tabBarHeight));
++    }
++    win.on?.('focus', () => lastFocusOf.set(win, ++focusCount));
++    win.on?.('focus', notifyHubFocusChange);
++    win.on?.('blur', notifyHubFocusChange);
++    win.once?.('closed', () => {
++        notifyHubFocusChange();
++        hubViewByWindow.delete(win);
++        hubCurtainViewByWindow.delete(win);
++        hubCurtainColorByWindow.delete(win);
++        tabBarHeightByWindow.delete(win);
++        accountTabWebContentsByWindow.delete(win);
++        for (const [id, mappedWin] of windowByWebContentsId.entries()) {
++            if (mappedWin === win) {
++                windowByWebContentsId.delete(id);
++            }
++        }
++    });
++}
++function setActiveHubViewForWindow(win, view, tabBarHeight) {
++    if (!win || typeof win !== 'object' || !view) {
++        return;
++    }
++    hubViewByWindow.set(win, view);
++    if (typeof tabBarHeight === 'number') {
++        tabBarHeightByWindow.set(win, Math.round(tabBarHeight));
++    }
++    if (view.webContents) {
++        registerWindowWebContents(win, view.webContents);
++    }
++}
++function registerAccountTabWebContents(win, contents) {
++    if (!win || !contents || typeof contents !== 'object') {
++        return;
++    }
++    registerWindowWebContents(win, contents);
++    accountTabWebContentsSet.add(contents);
++    let set = accountTabWebContentsByWindow.get(win);
++    if (!set) {
++        set = new Set();
++        accountTabWebContentsByWindow.set(win, set);
++    }
++    set.add(contents);
++    contents.once?.('destroyed', () => {
++        set.delete(contents);
++    });
++}
++function isRegisteredAccountTabWebContents(contents) {
++    return Boolean(contents && typeof contents === 'object' && accountTabWebContentsSet.has(contents));
++}
++function getAllHubWebContents(win) {
++    const out = [];
++    const seen = new Set();
++    const active = getHubWebContents(win);
++    if (active && !active.isDestroyed?.()) {
++        seen.add(active);
++        out.push(active);
++    }
++    const tabSet = win && typeof win === 'object' ? accountTabWebContentsByWindow.get(win) : undefined;
++    if (tabSet) {
++        for (const wc of tabSet) {
++            if (wc && !wc.isDestroyed?.() && !seen.has(wc)) {
++                seen.add(wc);
++                out.push(wc);
++            }
++        }
++    }
++    return out;
++}
+ /** Returns `true` while `loadHubWindowUrl` is awaiting a fresh bootstrap token before `win.loadURL(...)`. */
+ function isHubWindowBootstrapping(win) {
+     return Boolean(win && typeof win === 'object' && bootstrappingWindows.has(win));
+@@ -455,10 +564,11 @@
+     const hubWin = win;
+     windowByWebContents.set(contents, hubWin);
+     if (typeof contents.id === 'number') {
+-        windowByWebContentsId.set(contents.id, hubWin);
++        const contentsId = contents.id;
++        windowByWebContentsId.set(contentsId, hubWin);
+         contents.once?.('destroyed', () => {
+-            if (windowByWebContentsId.get(contents.id) === hubWin) {
+-                windowByWebContentsId.delete(contents.id);
++            if (windowByWebContentsId.get(contentsId) === hubWin) {
++                windowByWebContentsId.delete(contentsId);
+             }
+         });
+     }
+@@ -714,7 +824,7 @@
+         s.getType?.() !== 'webview' &&
+         Boolean(frame) &&
+         frame === s.mainFrame &&
+-        getLocalHubWindows().some((w) => getHubWebContents(w) === s));
++        getLocalHubWindows().some((w) => getHubWebContents(w) === s || accountTabWebContentsByWindow.get(w)?.has(s)));
+ }
+ /** Returns the currently focused top-level `HubWindow`, if any. */
+ function getFocusedHubWindow() {
+@@ -787,8 +897,8 @@
+         titleBarOverlay: isMacOS()
+             ? false
+             : {
+-                color: backgroundColor,
+-                symbolColor: foregroundColor,
++                color: '#00000000',
++                symbolColor: '#f1f5f9',
+                 height: windowState_1.DEFAULT_TITLE_BAR_OVERLAY_HEIGHT,
+             },
+         backgroundColor,
+@@ -1319,6 +1429,17 @@
+             hubContents.off?.('zoom-changed', handleZoomChanged);
+         });
+     }
++    const handleWallpaperInject = () => {
++        if (!win.isDestroyed?.() && !hubContents.isDestroyed?.()) {
++            require('./wallpaperEngine').injectWallpaperUi(hubContents);
++        }
++    };
++    hubContents.on('dom-ready', handleWallpaperInject);
++    hubContents.on('did-finish-load', handleWallpaperInject);
++    win.on('closed', () => {
++        hubContents.off?.('dom-ready', handleWallpaperInject);
++        hubContents.off?.('did-finish-load', handleWallpaperInject);
++    });
+     if (inactive) {
+         // Once: whichever comes first, the first paint or the fallback (a window
+         // the user hid after its load must not come back on the timer).

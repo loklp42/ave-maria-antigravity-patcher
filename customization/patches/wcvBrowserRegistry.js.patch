@@ -1,0 +1,16 @@
+--- a/dist/wcvBrowserRegistry.js
++++ b/dist/wcvBrowserRegistry.js
+@@ -1076,9 +1076,12 @@
+         const round = (value) => typeof value === 'number' && Number.isFinite(value)
+             ? Math.round(value)
+             : 0;
++        const tabBarOffsetY = typeof utils_1.getTabBarHeightForWindow === 'function'
++            ? (0, utils_1.getTabBarHeightForWindow)(entry.parentWindow)
++            : 0;
+         const nextBounds = {
+             x: round(bounds.x),
+-            y: round(bounds.y),
++            y: round(bounds.y) + tabBarOffsetY,
+             width: Math.max(0, round(bounds.width)),
+             height: Math.max(0, round(bounds.height)),
+         };

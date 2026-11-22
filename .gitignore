@@ -1,0 +1,36 @@
+# Build artifacts & binaries (distribute .exe via GitHub Releases)
+target/
+dist/
+build/
+*.exe
+*.dll
+*.node
+*.lib
+*.asar
+*.asar.new
+*.asar.tmp
+*.asar.temp
+*.asar.orig
+*.lnk
+
+# User custom wallpapers (keep README placeholder only)
+custom_wallpapers/*
+!custom_wallpapers/README.txt
+
+# Dependencies & caches
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+env/
+*.tsbuildinfo
+
+# OS & logs
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*

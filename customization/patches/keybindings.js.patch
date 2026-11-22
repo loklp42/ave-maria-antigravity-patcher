@@ -1,0 +1,14 @@
+--- a/dist/keybindings.js
++++ b/dist/keybindings.js
+@@ -22,6 +22,10 @@
+     };
+     hubContents?.on('before-input-event', handleBeforeInput);
+     win.once?.('closed', () => {
+-        hubContents?.off?.('before-input-event', handleBeforeInput);
++        try {
++            if (hubContents && !hubContents.isDestroyed?.()) {
++                hubContents.off?.('before-input-event', handleBeforeInput);
++            }
++        } catch {}
+     });
+ }

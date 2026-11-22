@@ -1,0 +1,154 @@
+--- a/dist/ipcHandlers.js
++++ b/dist/ipcHandlers.js
+@@ -71,6 +71,8 @@
+ const guestWebMcpController_1 = require("./guestWebMcpController");
+ const windowBackends_1 = require("./remote/windowBackends");
+ const remoteWindowSecurity_1 = require("./remote/remoteWindowSecurity");
++const agyAccounts = require("./agyAccounts");
++const agyTabManager = require("./agyTabManager");
+ function isMainFramePromptCaller(event) {
+     const s = event?.sender;
+     return Boolean(s &&
+@@ -210,7 +212,7 @@
+         }
+         return t.path;
+     }
+-    localOnly('dialog:open-workspace', async () => {
++    localOnly('dialog:open-workspace', async (event) => {
+         const result = await electron_1.dialog.showOpenDialog({
+             properties: ['openDirectory', 'createDirectory'],
+             title: 'Open workspace',
+@@ -219,7 +221,12 @@
+         if (result.canceled || result.filePaths.length === 0) {
+             return undefined;
+         }
+-        return mapPickedPath(result.filePaths[0]);
++        const picked = mapPickedPath(result.filePaths[0]);
++        const accId = agyTabManager.getAccountIdForWebContents(event?.sender);
++        if (picked && accId && accId !== 'default' && !wsl_1.getActiveWslDistro?.()) {
++            void agyAccounts.grantFolderAccessForAccount(accId, picked).catch(() => {});
++        }
++        return picked;
+     });
+     localOnly('dialog:get-default-download-dir', (event) => {
+         const sender = event?.sender;
+@@ -248,7 +255,7 @@
+     });
+     // Like 'dialog:open-workspace' but allows selecting multiple folders,
+     // returning an array of paths (empty if cancelled).
+-    localOnly('dialog:open-workspaces', async () => {
++    localOnly('dialog:open-workspaces', async (event) => {
+         const result = await electron_1.dialog.showOpenDialog({
+             properties: ['openDirectory', 'createDirectory', 'multiSelections'],
+             title: 'Open workspaces',
+@@ -257,9 +264,16 @@
+         if (result.canceled || result.filePaths.length === 0) {
+             return [];
+         }
+-        return result.filePaths
++        const pickedList = result.filePaths
+             .map(mapPickedPath)
+             .filter((p) => p !== undefined);
++        const accId = agyTabManager.getAccountIdForWebContents(event?.sender);
++        if (accId && accId !== 'default' && !wsl_1.getActiveWslDistro?.()) {
++            for (const dir of pickedList) {
++                void agyAccounts.grantFolderAccessForAccount(accId, dir).catch(() => {});
++            }
++        }
++        return pickedList;
+     });
+     // Auto-updater
+     localOnly('updater:apply', async () => {
+@@ -285,6 +299,10 @@
+             silent: options?.silent ?? false,
+         });
+         notification.on('click', () => {
++            if (!remote && agyTabManager.hasMainWindow()) {
++                agyTabManager.focusAccountTabForNotification(event?.sender, options?.payload);
++                return;
++            }
+             // A remote payload goes only to the window that posted it (if open); a
+             // local one to the first local window.
+             const win = remote
+@@ -471,6 +489,12 @@
+         if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+             return; // The tray counts local agents (remote ones outlive quitting).
+         }
++        const accId = agyTabManager.getAccountIdForWebContents(event?.sender);
++        if (accId) {
++            agyAccounts.updateRuntimeState(accId, { activeAgentCount: Number(count) || 0 });
++            (0, tray_1.updateTrayAgentCount)(agyTabManager.getTotalActiveAgentCount());
++            return;
++        }
+         (0, tray_1.updateTrayAgentCount)(count);
+     });
+     // Window
+@@ -478,6 +502,11 @@
+         // The sender's own window: each window has its own overlay, and a theme
+         // change reaches every window's renderer, focused or not.
+         const win = windowForSender(event?.sender);
++        if (win && typeof utils_1.isTabHostWindow === 'function' && (0, utils_1.isTabHostWindow)(win)) {
++            // Keep overlay height locked to top tab bar; only update symbolColor.
++            agyTabManager.updateTitleBarOverlay(options?.symbolColor || '#f1f5f9');
++            return;
++        }
+         // Windows and Linux windows both get a native caption-button overlay
+         // (see createWindow in utils.ts), so keep them in sync; macOS has none.
+         if (win && !(0, utils_1.isMacOS)()) {
+@@ -488,8 +517,8 @@
+             // skipped because converting it to an int fails quietly.
+             const height = (0, windowState_1.titleBarOverlayHeight)(options.height);
+             win.setTitleBarOverlay({
+-                color: options.color,
+-                symbolColor: options.symbolColor,
++                color: '#00000000',
++                symbolColor: options.symbolColor || '#f1f5f9',
+                 ...(height !== undefined ? { height } : {}),
+             });
+         }
+@@ -1042,13 +1071,17 @@
+     };
+     // The renderer only names a conversation; the uploads root itself is always
+     // derived here from the app data dir the Language Server was started with.
+-    const pinUploadsRoot = (conversationId) => {
++    const pinUploadsRoot = (conversationId, sender) => {
+         if (typeof conversationId !== 'string' ||
+             !SAFE_UPLOAD_CONVERSATION_ID_RE.test(conversationId) ||
+             /^\.+$/.test(conversationId)) {
+             return '';
+         }
+-        let appDataDir = (0, paths_1.getAppDataDir)();
++        const accId = agyTabManager.getAccountIdForWebContents(sender);
++        const acc = accId ? agyAccounts.getAccountById(accId) : null;
++        let appDataDir = accId && typeof paths_1.getAppDataDirForProfile === 'function'
++            ? (0, paths_1.getAppDataDirForProfile)(accId, acc?.geminiDir)
++            : (0, paths_1.getAppDataDir)();
+         try {
+             appDataDir = fsSync.realpathSync(appDataDir);
+         }
+@@ -1075,7 +1108,7 @@
+             ...(decision ?? { chooserId: '' }),
+         };
+         if (Array.isArray(pinned.files) && pinned.files.length > 0) {
+-            pinned.allowedUploadsDir = pinUploadsRoot(pinned.expectedConversationId);
++            pinned.allowedUploadsDir = pinUploadsRoot(pinned.expectedConversationId, event?.sender);
+         }
+         return guestFileChooserController_1.guestFileChooserController.handleFileChooser(wc, pinned);
+     });
+@@ -1083,14 +1116,14 @@
+         const { wc } = resolveMainFrameOwnedGuest(event, webContentsId, 'webview:set-input-files');
+         return guestFileChooserController_1.guestFileChooserController.setInputFiles(wc, {
+             ...request,
+-            allowedUploadsDir: pinUploadsRoot(request?.expectedConversationId),
++            allowedUploadsDir: pinUploadsRoot(request?.expectedConversationId, event?.sender),
+         });
+     });
+     localOnly('webview:resolve-upload-files', (event, req) => {
+         assertMainFrameSender(event, 'webview:resolve-upload-files');
+         return (0, guestFileChooserController_1.resolveGuestUploadFiles)(req && {
+             ...req,
+-            uploadsRoot: pinUploadsRoot(req.expectedConversationId),
++            uploadsRoot: pinUploadsRoot(req.expectedConversationId, event?.sender),
+         });
+     });
+     const assertMainFrameGuestCaller = (event, webContentsId, channel) => resolveMainFrameOwnedGuest(event, webContentsId, channel).wc;

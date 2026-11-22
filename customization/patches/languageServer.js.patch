@@ -1,0 +1,771 @@
+--- a/dist/languageServer.js
++++ b/dist/languageServer.js
+@@ -50,9 +50,19 @@
+ exports.startLanguageServer = startLanguageServer;
+ exports.setIntentionalTermination = setIntentionalTermination;
+ exports.startAndMonitorLanguageServer = startAndMonitorLanguageServer;
++exports.configureLanguageServerPool = configureLanguageServerPool;
++exports.ensureProfileServer = ensureProfileServer;
++exports.getProfileServerInfo = getProfileServerInfo;
++exports.setActiveProfileServer = setActiveProfileServer;
++exports.switchActiveProfileInPlace = switchActiveProfileInPlace;
++exports.stopProfileServer = stopProfileServer;
++exports.getRunningProfiles = getRunningProfiles;
++exports.consumeForceRootReload = consumeForceRootReload;
+ exports.killLanguageServer = killLanguageServer;
+ exports.setupLocalCertTrust = setupLocalCertTrust;
++exports.setupLocalCertTrustForSession = setupLocalCertTrustForSession;
+ const child_process_1 = require("child_process");
++const crypto = __importStar(require("crypto"));
+ const electron_1 = require("electron");
+ const fs = __importStar(require("fs"));
+ const path_1 = __importDefault(require("path"));
+@@ -65,6 +75,7 @@
+ const wsl_1 = require("./wsl");
+ const lsDefaults_1 = require("./lsDefaults");
+ const loginShellEnvReads_1 = require("./loginShellEnvReads");
++const winIsolation = require("./agyWinUserIsolation");
+ // ---------------------------------------------------------------------------
+ // Config
+ // ---------------------------------------------------------------------------
+@@ -137,6 +148,82 @@
+ let _lastRestartTime = 0;
+ let _lsStdinIsLiveness = false;
+ let _killLsPromise = null;
++let _lastStartParams = null;
++let _profileSwitchPromise = null;
++let _forceRootReload = false;
++const _profileServers = new Map();
++const _startingPromises = new Map();
++const _restartCounters = new Map();
++let _poolBaseOptions = null;
++function configureLanguageServerPool(options = {}) {
++    _poolBaseOptions = { ...(options || {}) };
++    if (!_lastStartParams) {
++        _lastStartParams = {
++            port: 0,
++            csrf: crypto.randomUUID(),
++            options: _poolBaseOptions,
++        };
++    }
++    else {
++        _lastStartParams.options = { ..._lastStartParams.options, ..._poolBaseOptions };
++    }
++}
++function getProfileServerInfo(profileId) {
++    const key = normalizeProfileKey(profileId);
++    const entry = _profileServers.get(key);
++    if (!entry || !isServerEntryAlive(entry)) {
++        return null;
++    }
++    return {
++        profileKey: key,
++        port: entry.port,
++        csrf: entry.csrf,
++        baseUrl: `https://127.0.0.1:${entry.port}`,
++        running: true,
++        winUser: entry.winUser || '',
++        geminiDir: entry.geminiDir || '',
++    };
++}
++function setActiveProfileServer(profileId) {
++    const key = normalizeProfileKey(profileId);
++    const entry = _profileServers.get(key);
++    (0, paths_1.setActiveProfileName)(key === 'default' ? '' : key, false);
++    if (entry && isServerEntryAlive(entry)) {
++        _lsProcess = entry.process;
++        _lsStdinIsLiveness = entry.stdinIsLiveness;
++        (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: entry.port, csrfToken: entry.csrf });
++        return { ok: true, port: entry.port, csrf: entry.csrf, profileKey: key };
++    }
++    return { ok: false, profileKey: key };
++}
++function normalizeProfileKey(raw) {
++    const clean = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
++    return clean || 'default';
++}
++function getActiveProfileKey() {
++    return normalizeProfileKey((0, paths_1.getActiveProfileName)());
++}
++function isServerEntryAlive(entry) {
++    if (!entry || !entry.process || !entry.port) {
++        return false;
++    }
++    const p = entry.process;
++    return (p.exitCode ?? null) === null && (p.signalCode ?? null) === null && !p.killed;
++}
++function getRunningProfiles() {
++    const out = [];
++    for (const [key, entry] of _profileServers.entries()) {
++        if (isServerEntryAlive(entry)) {
++            out.push(key);
++        }
++    }
++    return out;
++}
++function consumeForceRootReload() {
++    const v = _forceRootReload;
++    _forceRootReload = false;
++    return v;
++}
+ /** Returns the active language server process, or null if not running. */
+ function getLsProcess() {
+     return _lsProcess;
+@@ -234,14 +321,23 @@
+  * crashes that occur after startup.
+  */
+ async function startLanguageServer(port, csrf, options = {}) {
+-    const { headless, hostBridgeUrl, hostBridgeToken, wsl } = options;
++    const { headless, hostBridgeUrl, hostBridgeToken, wsl, profileId, winUser, geminiDir: explicitGeminiDir } = options;
++    const profileKey = normalizeProfileKey(profileId !== undefined ? profileId : (0, paths_1.getActiveProfileName)());
++    const profileArg = profileKey === 'default' ? '' : profileKey;
++    const useWinIsolation = Boolean(isWindows && profileArg && winUser);
++    const resolvedGeminiDir = profileArg
++        ? (explicitGeminiDir || (useWinIsolation ? winIsolation.getIsolatedGeminiDir(profileArg) : (0, paths_1.getGeminiDirForProfile)(profileArg)))
++        : '';
++    const isForActive = profileKey === getActiveProfileKey();
+     const loginShellEnv = await shellEnvReads.take();
+     if (_intentionalTermination) {
+         throw new Error('Language server startup aborted during shutdown');
+     }
+     return new Promise((resolve, reject) => {
+-        const logStream = fs.createWriteStream((0, paths_1.getLsLogPath)(), { flags: 'w' });
+-        (0, authBootstrap_1.setActiveLanguageServerAuth)({ csrfToken: csrf });
++        const logStream = fs.createWriteStream((0, paths_1.getLsLogPath)(profileArg), { flags: 'w' });
++        if (isForActive) {
++            (0, authBootstrap_1.setActiveLanguageServerAuth)({ csrfToken: csrf });
++        }
+         // We need to pass the override flags because the LS is running in standalone mode.
+         // Secrets (CSRF token and host bridge token) are passed via child env / stdin
+         // rather than CLI argv so they are never exposed in `ps` or `/proc/<pid>/cmdline`.
+@@ -249,10 +345,15 @@
+             ...(0, lsDefaults_1.baseLsArgs)({
+                 ideVersion: electron_1.app.getVersion(),
+                 httpsServerPort: port,
+-                appDataDir: (0, paths_1.getAppDataDirName)(),
++                appDataDir: (0, paths_1.getAppDataDirName)(profileArg),
++                overrideIdeName: (0, paths_1.getOverrideIdeName)(),
+             }),
+             '--enable_sidecars',
+         ];
++        if (profileArg && resolvedGeminiDir) {
++            try { fs.mkdirSync(resolvedGeminiDir, { recursive: true }); } catch {}
++            args.push(`--gemini_dir=${resolvedGeminiDir}`);
++        }
+         // Point the LS at the main process' host bridge server. The LS tolerates
+         // these being absent, but we always pass them when the server is up.
+         const hasHostBridgeToken = Boolean(hostBridgeUrl && hostBridgeToken);
+@@ -264,7 +365,7 @@
+         }
+         let spawnCmd = exports.LS_BINARY;
+         let spawnArgs = args;
+-        if (wsl) {
++        if (wsl && !useWinIsolation) {
+             // ANTIGRAVITY_VSCODE_HOST=1 makes the LS print sign-in URLs
+             // --exit_on_stdin_close ties the LS lifetime to our stdin pipe
+             args.push('--exit_on_stdin_close');
+@@ -276,7 +377,7 @@
+         const env = { ...process.env, ...loginShellEnv };
+         env['ANTIGRAVITY_SERVER_CSRF_TOKEN'] = csrf;
+         env['AGY_REQUIRE_AUTHENTICATED_UI_BOOTSTRAP'] = '1';
+-        if (wsl) {
++        if (wsl && !useWinIsolation) {
+             (0, authBootstrap_1.appendWslAuthEnvForwarding)(env);
+         }
+         if (electron_1.app.commandLine?.hasSwitch?.('remote-debugging-port')) {
+@@ -287,7 +388,9 @@
+             delete env['AGY_BROWSER_ACTIVE_PORT_FILE'];
+             delete env['AGY_BROWSER_WS_URL'];
+         }
+-        (0, utils_1.setupNodeWrapper)(env);
++        if (!useWinIsolation) {
++            (0, utils_1.setupNodeWrapper)(env);
++        }
+         setupNodeModules(env, [
+             {
+                 name: 'chrome-devtools-mcp',
+@@ -300,43 +403,74 @@
+         env['CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY'] = '1';
+         env['CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS'] = '1';
+         env['CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS'] = '1';
+-        console.log(`Spawning: ${spawnCmd} ${(0, authBootstrap_1.redactSensitiveArgsForLog)(spawnArgs).join(' ')}`);
+-        _lsProcess = (0, child_process_1.spawn)(spawnCmd, spawnArgs, {
+-            stdio: ['pipe', 'pipe', 'pipe'],
+-            env,
+-        });
+-        _lsStdinIsLiveness = !!wsl;
+-        _lsProcess.stdin?.on?.('error', () => {
++        const stdinPayload = hasHostBridgeToken && hostBridgeToken ? `${hostBridgeToken}\n\n` : '';
++        let proc;
++        if (useWinIsolation) {
++            console.log(`Spawning [${profileKey}] isolated as Windows user "${winUser}": ${exports.LS_BINARY} ${(0, authBootstrap_1.redactSensitiveArgsForLog)(args).join(' ')}`);
++            try {
++                proc = winIsolation.spawnIsolatedLanguageServer({
++                    accountId: profileKey,
++                    winUser,
++                    binaryPath: exports.LS_BINARY,
++                    args,
++                    env,
++                    stdinPayload,
++                });
++            }
++            catch (spawnErr) {
++                logStream.end();
++                reject(spawnErr);
++                return;
++            }
++        }
++        else {
++            console.log(`Spawning [${profileKey}]: ${spawnCmd} ${(0, authBootstrap_1.redactSensitiveArgsForLog)(spawnArgs).join(' ')}`);
++            proc = (0, child_process_1.spawn)(spawnCmd, spawnArgs, {
++                stdio: ['pipe', 'pipe', 'pipe'],
++                env,
++            });
++        }
++        const stdinIsLiveness = !!wsl && !useWinIsolation;
++        if (isForActive) {
++            _lsProcess = proc;
++            _lsStdinIsLiveness = stdinIsLiveness;
++        }
++        proc.stdin?.on?.('error', () => {
+             // Ignore EPIPE if the child exits before consuming stdin.
+         });
+-        if (hasHostBridgeToken && hostBridgeToken) {
+-            if (wsl) {
+-                // `--exit_on_stdin_close` is true: `readHostTokensFromStdin` returns
+-                // immediately after line 1, and stdin must stay open for liveness.
+-                _lsProcess.stdin?.write?.(`${hostBridgeToken}\n`);
+-            }
+-            else if (headless) {
+-                // `--exit_on_stdin_close` is false, and stdin stays open for headless
+-                // OAuth input: send line 1 + empty line 2 so LS startup does not block.
+-                _lsProcess.stdin?.write?.(`${hostBridgeToken}\n\n`);
+-            }
+-            else {
+-                // Desktop local mode: write hostBridgeToken + empty line 2 and close stdin.
+-                _lsProcess.stdin?.end?.(`${hostBridgeToken}\n\n`);
+-            }
+-        }
+-        else if (!headless && !wsl) {
+-            // Close stdin immediately — the LS may block waiting for metadata on stdin.
+-            // In WSL mode stdin must stay open: it is the LS's liveness signal.
+-            _lsProcess.stdin?.end?.();
++        if (!useWinIsolation) {
++            if (hasHostBridgeToken && hostBridgeToken) {
++                if (wsl) {
++                    // `--exit_on_stdin_close` is true: `readHostTokensFromStdin` returns
++                    // immediately after line 1, and stdin must stay open for liveness.
++                    proc.stdin?.write?.(`${hostBridgeToken}\n`);
++                }
++                else if (headless) {
++                    // `--exit_on_stdin_close` is false, and stdin stays open for headless
++                    // OAuth input: send line 1 + empty line 2 so LS startup does not block.
++                    proc.stdin?.write?.(`${hostBridgeToken}\n\n`);
++                }
++                else {
++                    // Desktop local mode: write hostBridgeToken + empty line 2 and close stdin.
++                    proc.stdin?.end?.(`${hostBridgeToken}\n\n`);
++                }
++            }
++            else if (!headless && !wsl) {
++                // Close stdin immediately — the LS may block waiting for metadata on stdin.
++                // In WSL mode stdin must stay open: it is the LS's liveness signal.
++                proc.stdin?.end?.();
++            }
++        }
++        else {
++            proc.stdin?.end?.();
+         }
+         const combined = new stream_1.PassThrough();
+-        _lsProcess.stdout.pipe(combined, { end: false });
+-        _lsProcess.stderr.pipe(combined, { end: false });
++        proc.stdout.pipe(combined, { end: false });
++        proc.stderr.pipe(combined, { end: false });
+         // Buffer stderr for crash log extraction (ring buffer)
+         const stderrChunks = [];
+         let stderrLength = 0;
+-        _lsProcess.stderr.on('data', (data) => {
++        proc.stderr.on('data', (data) => {
+             const str = data.toString();
+             stderrChunks.push(str);
+             stderrLength += str.length;
+@@ -349,6 +483,7 @@
+         const timer = setTimeout(() => {
+             if (!resolved) {
+                 resolved = true;
++                try { void killSingleProcess(proc, stdinIsLiveness); } catch {}
+                 reject(new Error(`Timeout: language server did not report its port within ${LS_STARTUP_TIMEOUT_MS / 1000}s`));
+             }
+         }, LS_STARTUP_TIMEOUT_MS);
+@@ -369,11 +504,15 @@
+                     resolved = true;
+                     clearTimeout(timer);
+                     const actualPort = parseInt(m[1], 10);
+-                    (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: actualPort, csrfToken: csrf });
++                    if (profileKey === getActiveProfileKey()) {
++                        (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: actualPort, csrfToken: csrf });
++                    }
+                     resolve({
+                         port: actualPort,
+-                        process: _lsProcess,
++                        process: proc,
+                         exitPromise,
++                        profileKey,
++                        stdinIsLiveness,
+                     });
+                 }
+             }
+@@ -393,11 +532,14 @@
+         });
+         // Exit promise — resolves whenever the process exits (whether during
+         // startup or after). Includes crash stack trace extraction.
+-        const proc = _lsProcess;
+         const exitPromise = new Promise((exitResolve) => {
+             proc.on('exit', (code, signal) => {
+                 if (_lsProcess === proc) {
+                     clearLsProcess();
++                }
++                const pooled = _profileServers.get(profileKey);
++                if (pooled && pooled.process === proc) {
++                    _profileServers.delete(profileKey);
+                 }
+                 if (!logStreamEnded) {
+                     logStreamEnded = true;
+@@ -425,78 +567,307 @@
+  * Resolves with the handle on first successful startup.
+  */
+ async function startAndMonitorLanguageServer(port, csrf, options = {}) {
++    _lastStartParams = { port, csrf, options };
+     setIntentionalTermination(false); // Reset
+-    const handle = await startLanguageServer(port, csrf, options);
+-    (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: handle.port, csrfToken: csrf });
+-    if (options.onPortChanged) {
+-        options.onPortChanged(handle.port);
+-    }
+-    monitorLsCrashInternal(handle, port, csrf, options);
++    const profileKey = normalizeProfileKey(options.profileId !== undefined ? options.profileId : (0, paths_1.getActiveProfileName)());
++    const handle = await startLanguageServer(port, csrf, { ...options, profileId: profileKey });
++    const entry = {
++        profileKey,
++        process: handle.process,
++        port: handle.port,
++        csrf,
++        exitPromise: handle.exitPromise,
++        stdinIsLiveness: handle.stdinIsLiveness,
++        intentionalStop: false,
++    };
++    _profileServers.set(profileKey, entry);
++    if (profileKey === getActiveProfileKey()) {
++        _lsProcess = entry.process;
++        _lsStdinIsLiveness = entry.stdinIsLiveness;
++        (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: entry.port, csrfToken: csrf });
++        if (options.onPortChanged) {
++            options.onPortChanged(entry.port);
++        }
++    }
++    monitorLsCrashInternal(entry, port, csrf, options);
+     return handle;
+ }
+-function monitorLsCrashInternal(handle, port, csrf, options) {
+-    void handle.exitPromise.then(async (exitInfo) => {
+-        clearLsProcess();
+-        (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0 });
+-        options.onExited?.();
+-        if (_intentionalTermination) {
++async function switchActiveProfileInPlace(targetProfileId) {
++    const requestedProfile = String(targetProfileId ?? '').trim().toLowerCase();
++    if (!requestedProfile || !/^[a-z0-9_-]+$/.test(requestedProfile)) {
++        throw new Error('invalid_profile_id');
++    }
++    if (!_lastStartParams) {
++        throw new Error('Language server has not started yet');
++    }
++    if (_profileSwitchPromise) {
++        return _profileSwitchPromise;
++    }
++    _profileSwitchPromise = (async () => {
++        const targetKey = normalizeProfileKey(requestedProfile);
++        const prevKey = getActiveProfileKey();
++        const existing = _profileServers.get(targetKey);
++
++        if (targetKey === prevKey && isServerEntryAlive(existing)) {
++            return { ok: true, same: true, profile: targetKey, port: existing.port, reused: true };
++        }
++
++        // Reuse already-running LS for target profile (instant switch, keeps all other profiles' agents alive!)
++        if (isServerEntryAlive(existing)) {
++            (0, paths_1.setActiveProfileName)(targetKey === 'default' ? '' : targetKey, true);
++            _lsProcess = existing.process;
++            _lsStdinIsLiveness = existing.stdinIsLiveness;
++            _forceRootReload = true;
++            (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: existing.port, csrfToken: existing.csrf });
++            _lastStartParams.options?.onPortChanged?.(existing.port);
++            return { ok: true, profile: targetKey, port: existing.port, reused: true };
++        }
++
++        // Spawn a dedicated LS for the target profile WITHOUT killing the previous profile's LS!
++        const profileArg = targetKey === 'default' ? '' : targetKey;
++        if (profileArg) {
++            const gDir = (0, paths_1.getGeminiDirForProfile)(profileArg);
++            try { fs.mkdirSync(gDir, { recursive: true }); } catch {}
++        }
++        const spawnOptions = {
++            ..._lastStartParams.options,
++            profileId: targetKey,
++        };
++        const handle = await startLanguageServer(0, _lastStartParams.csrf, spawnOptions);
++        const entry = {
++            profileKey: targetKey,
++            process: handle.process,
++            port: handle.port,
++            csrf: _lastStartParams.csrf,
++            exitPromise: handle.exitPromise,
++            stdinIsLiveness: handle.stdinIsLiveness,
++            intentionalStop: false,
++        };
++        _profileServers.set(targetKey, entry);
++        (0, paths_1.setActiveProfileName)(profileArg, true);
++        _lsProcess = entry.process;
++        _lsStdinIsLiveness = entry.stdinIsLiveness;
++        _restartCount = 0;
++        _forceRootReload = true;
++        (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: entry.port, csrfToken: entry.csrf });
++        monitorLsCrashInternal(entry, 0, entry.csrf, _lastStartParams.options);
++        _lastStartParams.options?.onPortChanged?.(entry.port);
++        return { ok: true, profile: targetKey, port: entry.port, reused: false };
++    })().finally(() => {
++        _profileSwitchPromise = null;
++    });
++    return _profileSwitchPromise;
++}
++async function ensureProfileServer(profileId, extraOptions = {}) {
++    const profileKey = normalizeProfileKey(profileId);
++    const existing = _profileServers.get(profileKey);
++    if (isServerEntryAlive(existing)) {
++        return {
++            ok: true,
++            reused: true,
++            profileKey,
++            port: existing.port,
++            csrf: existing.csrf,
++            baseUrl: `https://127.0.0.1:${existing.port}`,
++            winUser: existing.winUser || '',
++            geminiDir: existing.geminiDir || '',
++        };
++    }
++    const pending = _startingPromises.get(profileKey);
++    if (pending) {
++        return pending;
++    }
++    const startPromise = (async () => {
++        setIntentionalTermination(false);
++        const baseOpts = _poolBaseOptions || _lastStartParams?.options || {};
++        const csrf = crypto.randomUUID();
++        const mergedOptions = {
++            ...baseOpts,
++            ...extraOptions,
++            profileId: profileKey,
++        };
++        const targetPort = profileKey === 'default' && Number(process.env.JETSKI_LS_PORT) > 0
++            ? Number(process.env.JETSKI_LS_PORT)
++            : 0;
++        const handle = await startLanguageServer(targetPort, csrf, mergedOptions);
++        const entry = {
++            profileKey,
++            process: handle.process,
++            port: handle.port,
++            csrf,
++            exitPromise: handle.exitPromise,
++            stdinIsLiveness: handle.stdinIsLiveness,
++            intentionalStop: false,
++            winUser: mergedOptions.winUser || '',
++            geminiDir: mergedOptions.geminiDir || '',
++        };
++        _profileServers.set(profileKey, entry);
++        _restartCounters.set(profileKey, { count: 0, lastTime: 0 });
++        if (profileKey === getActiveProfileKey()) {
++            _lsProcess = entry.process;
++            _lsStdinIsLiveness = entry.stdinIsLiveness;
++            (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: entry.port, csrfToken: csrf });
++        }
++        setupLocalCertTrust();
++        monitorLsCrashInternal(entry, 0, csrf, mergedOptions);
++        mergedOptions.onInstancePortChanged?.(profileKey, entry.port, csrf);
++        return {
++            ok: true,
++            reused: false,
++            profileKey,
++            port: entry.port,
++            csrf,
++            baseUrl: `https://127.0.0.1:${entry.port}`,
++            winUser: entry.winUser,
++            geminiDir: entry.geminiDir,
++        };
++    })().finally(() => {
++        _startingPromises.delete(profileKey);
++    });
++    _startingPromises.set(profileKey, startPromise);
++    return startPromise;
++}
++async function stopProfileServer(profileId, opts = {}) {
++    const targetKey = normalizeProfileKey(profileId);
++    if (!opts.allowActive && targetKey === getActiveProfileKey()) {
++        return { ok: false, error: 'cannot_stop_active' };
++    }
++    const entry = _profileServers.get(targetKey);
++    if (!entry) {
++        return { ok: true, stopped: false };
++    }
++    entry.intentionalStop = true;
++    _profileServers.delete(targetKey);
++    await killSingleProcess(entry.process, entry.stdinIsLiveness);
++    return { ok: true, stopped: true };
++}
++function monitorLsCrashInternal(entry, port, csrf, options) {
++    const profileKey = entry.profileKey || 'default';
++    void entry.exitPromise.then(async (exitInfo) => {
++        const pooled = _profileServers.get(profileKey);
++        if (pooled === entry) {
++            _profileServers.delete(profileKey);
++        }
++        if (entry.intentionalStop || _intentionalTermination) {
+             return;
+         }
++        const isStillActive = profileKey === getActiveProfileKey();
++        if (isStillActive) {
++            clearLsProcess();
++            (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0 });
++            options.onExited?.();
++        }
++        options.onInstanceExited?.(profileKey, exitInfo);
+         const { code, signal, crashStackTrace } = exitInfo;
+         const isSelfRestart = code === LS_RESTART_EXIT_CODE && !signal;
+         if (isSelfRestart) {
+-            console.log(`Language server exited for restart (code ${LS_RESTART_EXIT_CODE}). Restarting…`);
++            console.log(`Language server [${profileKey}] exited for restart (code ${LS_RESTART_EXIT_CODE}). Restarting…`);
+         }
+         else {
+             const summary = signal
+                 ? `killed by signal ${signal}`
+                 : `exited with code ${code}`;
+-            console.error(`\nLanguage server crashed: ${summary}`);
++            console.error(`\nLanguage server [${profileKey}] crashed: ${summary}`);
+             if (crashStackTrace) {
+                 console.error('--- Crash Stack Trace ---');
+                 console.error(crashStackTrace);
+                 console.error('--- End Crash Stack trace ---');
+             }
++            const counter = _restartCounters.get(profileKey) || { count: 0, lastTime: 0 };
+             const now = Date.now();
+-            if (now - _lastRestartTime > RESTART_WINDOW_MS) {
+-                _restartCount = 0;
+-            }
+-            _lastRestartTime = now;
+-            if (_restartCount >= MAX_RESTARTS) {
+-                const msg = `Language server crashed ${MAX_RESTARTS} times in a row. Giving up.`;
++            if (now - counter.lastTime > RESTART_WINDOW_MS) {
++                counter.count = 0;
++            }
++            counter.lastTime = now;
++            if (counter.count >= MAX_RESTARTS) {
++                const msg = `Language server [${profileKey}] crashed ${MAX_RESTARTS} times in a row. Giving up.`;
+                 console.error(msg);
+-                (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0, csrfToken: '' });
++                if (isStillActive) {
++                    (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0, csrfToken: '' });
++                }
+                 return;
+             }
+-            _restartCount++;
+-            console.log(`Attempting restart ${_restartCount}/${MAX_RESTARTS} in ${RESTART_COOLDOWN_MS / 1000}s...`);
++            counter.count++;
++            _restartCounters.set(profileKey, counter);
++            console.log(`Attempting restart [${profileKey}] ${counter.count}/${MAX_RESTARTS} in ${RESTART_COOLDOWN_MS / 1000}s...`);
+             await sleep(RESTART_COOLDOWN_MS);
+         }
+-        if (_intentionalTermination) {
++        if (_intentionalTermination || entry.intentionalStop) {
+             return;
+         }
+         try {
+-            // Pass the same options and main-process CSRF token through so main-process
+-            // RPC clients (ActuatorService, MendelFlagSync) stay authenticated across
+-            // restarts while each window re-mints a fresh #t= token on the new port.
+-            const newHandle = await startLanguageServer(port, csrf, options);
+-            (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: newHandle.port, csrfToken: csrf });
+-            if (options.onPortChanged) {
+-                options.onPortChanged(newHandle.port);
+-            }
+-            // Recurse
+-            monitorLsCrashInternal(newHandle, port, csrf, options);
++            const nextCsrf = crypto.randomUUID();
++            const newHandle = await startLanguageServer(port, nextCsrf, { ...options, profileId: profileKey });
++            const newEntry = {
++                profileKey,
++                process: newHandle.process,
++                port: newHandle.port,
++                csrf: nextCsrf,
++                exitPromise: newHandle.exitPromise,
++                stdinIsLiveness: newHandle.stdinIsLiveness,
++                intentionalStop: false,
++                winUser: entry.winUser || options.winUser || '',
++                geminiDir: entry.geminiDir || options.geminiDir || '',
++            };
++            _profileServers.set(profileKey, newEntry);
++            if (profileKey === getActiveProfileKey()) {
++                _lsProcess = newEntry.process;
++                _lsStdinIsLiveness = newEntry.stdinIsLiveness;
++                (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: newEntry.port, csrfToken: nextCsrf });
++                if (options.onPortChanged) {
++                    options.onPortChanged(newEntry.port);
++                }
++            }
++            options.onInstancePortChanged?.(profileKey, newEntry.port, nextCsrf);
++            monitorLsCrashInternal(newEntry, port, nextCsrf, options);
+         }
+         catch (err) {
+             if (!_intentionalTermination) {
+-                console.error(`Failed to restart language server: ${err.message}`);
+-            }
+-            (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0, csrfToken: '' });
++                console.error(`Failed to restart language server [${profileKey}]: ${err.message}`);
++            }
++            if (profileKey === getActiveProfileKey()) {
++                (0, authBootstrap_1.setActiveLanguageServerAuth)({ port: 0, csrfToken: '' });
++            }
+         }
+     });
+ }
+ function sleep(ms) {
+     return new Promise((resolve) => setTimeout(resolve, ms));
++}
++async function killSingleProcess(proc, stdinIsLiveness) {
++    if (!proc) return;
++    if ((proc.exitCode ?? null) !== null || (proc.signalCode ?? null) !== null) return;
++    const pid = proc.pid;
++    const exitPromise = new Promise((resolve) => {
++        proc.once('exit', () => resolve());
++    });
++    if (stdinIsLiveness && proc.stdin && !proc.stdin.destroyed) {
++        proc.stdin.end();
++    }
++    else if (process.platform === 'win32' && pid !== undefined) {
++        await (0, util_1.promisify)(child_process_1.execFile)('taskkill', ['/pid', String(pid), '/T', '/F'], {
++            timeout: 5000,
++            windowsHide: true,
++        }).catch(() => {
++            try { proc.kill('SIGTERM'); } catch {}
++        });
++    }
++    else {
++        try { proc.kill('SIGTERM'); } catch {}
++    }
++    const result = await Promise.race([
++        exitPromise.then(() => 'exited'),
++        sleep(5000).then(() => 'timeout'),
++    ]);
++    if (result === 'timeout' && pid !== undefined) {
++        console.warn(`Language server (PID ${pid}) did not exit gracefully within 5s. Sending SIGKILL.`);
++        try {
++            process.kill(pid, 'SIGKILL');
++        }
++        catch {
++            // Process already dead or exited
++        }
++    }
+ }
+ async function killLanguageServer() {
+     setIntentionalTermination(true);
+@@ -504,54 +875,23 @@
+         return _killLsPromise;
+     }
+     _killLsPromise = (async () => {
+-        const proc = getLsProcess();
+-        if (!proc) {
++        const targets = new Map();
++        for (const entry of _profileServers.values()) {
++            entry.intentionalStop = true;
++            if (entry.process) {
++                targets.set(entry.process, entry.stdinIsLiveness);
++            }
++        }
++        _profileServers.clear();
++        const activeProc = getLsProcess();
++        if (activeProc && !targets.has(activeProc)) {
++            targets.set(activeProc, _lsStdinIsLiveness);
++        }
++        if (targets.size === 0) {
+             return;
+         }
+-        if ((proc.exitCode ?? null) !== null ||
+-            (proc.signalCode ?? null) !== null) {
+-            clearLsProcess();
+-            return;
+-        }
+-        const pid = proc.pid;
+-        console.log('Shutting down language server…');
+-        const exitPromise = new Promise((resolve) => {
+-            proc.once('exit', () => {
+-                resolve();
+-            });
+-        });
+-        if (_lsStdinIsLiveness && proc.stdin && !proc.stdin.destroyed) {
+-            // WSL: a Windows SIGTERM only reaches the wsl.exe relay, not the LS in
+-            // the distro. Closing stdin triggers the LS's --exit_on_stdin_close
+-            // graceful shutdown instead.
+-            proc.stdin.end();
+-        }
+-        else if (process.platform === 'win32' && pid !== undefined) {
+-            // Kill the full Windows process tree (agy-node.cmd -> Antigravity.exe,
+-            // MCP servers, sidecars, tsserver) while parent-child links are intact.
+-            await (0, util_1.promisify)(child_process_1.execFile)('taskkill', ['/pid', String(pid), '/T', '/F'], {
+-                timeout: 5000,
+-                windowsHide: true,
+-            }).catch(() => {
+-                proc.kill('SIGTERM');
+-            });
+-        }
+-        else {
+-            proc.kill('SIGTERM');
+-        }
+-        const result = await Promise.race([
+-            exitPromise.then(() => 'exited'),
+-            sleep(5000).then(() => 'timeout'),
+-        ]);
+-        if (result === 'timeout' && pid !== undefined) {
+-            console.warn(`Language server (PID ${pid}) did not exit gracefully within 5s. Sending SIGKILL.`);
+-            try {
+-                process.kill(pid, 'SIGKILL');
+-            }
+-            catch {
+-                // Process already dead or exited
+-            }
+-        }
++        console.log(`Shutting down ${targets.size} language server instance(s)…`);
++        await Promise.all(Array.from(targets.entries()).map(([proc, liveness]) => killSingleProcess(proc, liveness)));
+         clearLsProcess();
+     })().finally(() => {
+         clearLsProcess();
+@@ -564,8 +904,13 @@
+  * Sets up certificate verification in Electron to trust local connections
+  * (127.0.0.1 or localhost) used by the language server.
+  */
+-function setupLocalCertTrust() {
+-    electron_1.session.defaultSession.setCertificateVerifyProc((request, callback) => {
++const trustedSessions = new WeakSet();
++function setupLocalCertTrustForSession(targetSession) {
++    if (!targetSession || trustedSessions.has(targetSession)) {
++        return;
++    }
++    trustedSessions.add(targetSession);
++    targetSession.setCertificateVerifyProc((request, callback) => {
+         if (request.hostname === '127.0.0.1' || request.hostname === 'localhost') {
+             callback(0); // Accept
+         }
+@@ -574,3 +919,6 @@
+         }
+     });
+ }
++function setupLocalCertTrust() {
++    setupLocalCertTrustForSession(electron_1.session.defaultSession);
++}

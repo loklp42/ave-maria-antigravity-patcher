@@ -1,0 +1,29 @@
+--- a/dist/windowState.js
++++ b/dist/windowState.js
+@@ -443,14 +443,18 @@
+     };
+     const dispose = () => {
+         clearTimer();
+-        win.off?.('resize', scheduleSave);
+-        win.off?.('move', scheduleSave);
+-        win.off?.('maximize', scheduleSave);
+-        win.off?.('unmaximize', scheduleSave);
+-        win.off?.('enter-full-screen', scheduleSave);
+-        win.off?.('leave-full-screen', scheduleSave);
+-        win.off?.('close', handleClose);
+-        win.off?.('closed', dispose);
++        try {
++            if (!win.isDestroyed?.()) {
++                win.off?.('resize', scheduleSave);
++                win.off?.('move', scheduleSave);
++                win.off?.('maximize', scheduleSave);
++                win.off?.('unmaximize', scheduleSave);
++                win.off?.('enter-full-screen', scheduleSave);
++                win.off?.('leave-full-screen', scheduleSave);
++                win.off?.('close', handleClose);
++                win.off?.('closed', dispose);
++            }
++        } catch {}
+         if (activeTrackers.get(win) === tracker) {
+             activeTrackers.delete(win);
+         }

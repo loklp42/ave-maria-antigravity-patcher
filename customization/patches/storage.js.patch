@@ -1,0 +1,34 @@
+--- a/dist/storage.js
++++ b/dist/storage.js
+@@ -246,17 +246,21 @@
+                 await fs.unlink(tmp).catch(() => undefined);
+             }
+             for (const win of (0, utils_1.getHubWindows)()) {
+-                const hubContents = (0, utils_1.getHubWebContents)(win);
+-                if (hubContents && !hubContents.isDestroyed?.()) {
+-                    // The update is saved: one window must not keep it from the others.
+-                    try {
+-                        const scoped = this.scope(win, changes);
+-                        if (scoped && Object.keys(scoped).length > 0) {
+-                            hubContents.send('storage:changed', scoped);
++                const targets = typeof utils_1.getAllHubWebContents === 'function'
++                    ? (0, utils_1.getAllHubWebContents)(win)
++                    : [(0, utils_1.getHubWebContents)(win)];
++                for (const hubContents of targets) {
++                    if (hubContents && !hubContents.isDestroyed?.()) {
++                        // The update is saved: one window must not keep it from the others.
++                        try {
++                            const scoped = this.scope(win, changes);
++                            if (scoped && Object.keys(scoped).length > 0) {
++                                hubContents.send('storage:changed', scoped);
++                            }
+                         }
+-                    }
+-                    catch (e) {
+-                        console.error('Error sending storage changes to a window:', e);
++                        catch (e) {
++                            console.error('Error sending storage changes to a window:', e);
++                        }
+                     }
+                 }
+             }

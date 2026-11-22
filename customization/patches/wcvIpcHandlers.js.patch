@@ -1,0 +1,22 @@
+--- a/dist/wcvIpcHandlers.js
++++ b/dist/wcvIpcHandlers.js
+@@ -147,7 +147,8 @@
+     }
+     const win = (0, utils_1.resolveHubWindowFromWebContents)(s);
+     const hub = win ? (0, utils_1.getHubWebContents)(win) : undefined;
+-    return hub === s || (typeof s.id === 'number' && hub?.id === s.id);
++    const isTab = typeof utils_1.isRegisteredAccountTabWebContents === 'function' && (0, utils_1.isRegisteredAccountTabWebContents)(s);
++    return isTab || hub === s || (typeof s.id === 'number' && hub?.id === s.id);
+ }
+ function assertAuthorizedWcvCaller(event, registry, tabKey) {
+     const sender = event?.sender;
+@@ -162,7 +163,8 @@
+         throw new Error('Unauthorized WCV IPC caller: SSH window');
+     }
+     const win = (0, utils_1.resolveHubWindowFromWebContents)(sender);
+-    if (!win || (0, utils_1.getHubWebContents)(win) !== sender) {
++    const isTab = typeof utils_1.isRegisteredAccountTabWebContents === 'function' && (0, utils_1.isRegisteredAccountTabWebContents)(sender);
++    if (!win || (!isTab && (0, utils_1.getHubWebContents)(win) !== sender)) {
+         throw new Error('Unauthorized WCV IPC window sender');
+     }
+     if (tabKey !== undefined) {
