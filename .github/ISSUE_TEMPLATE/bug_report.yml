@@ -4,13 +4,24 @@ title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: dropdown
+    id: os
+    attributes:
+      label: "Операционная система"
+      options:
+        - "Windows 11 / 10"
+        - "Linux (Ubuntu / Debian)"
+        - "Linux (Arch / Fedora / другой дистрибутив)"
+    validations:
+      required: true
+
+  - type: dropdown
     id: component
     attributes:
       label: "Где возникла проблема?"
       options:
-        - "Патчер (AntigravityPatcher.exe)"
+        - "Патчер (GUI / CLI)"
         - "Живые / фото-обои"
-        - "Плеер"
+        - "Плеер (SMTC / MPRIS)"
         - "Русификация (RU / EN)"
         - "Мультиаккаунты / Вкладки"
         - "Интерфейс / Настройки персонализации"

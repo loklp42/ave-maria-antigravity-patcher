@@ -1,14 +1,15 @@
 """
-Chromium ASAR Archive Reader and Packer
+Chromium ASAR Archive Reader and Packer.
 Fully compliant with Electron / Chromium ASAR archive format.
-Supports streaming extraction, repackaging, and SHA-256 integrity block generation.
+Supports streaming extraction, repackaging with unpacked/executable/symlink
+and unpacked-directory metadata preservation, and SHA-256 integrity blocks.
 """
 
 import os
 import json
 import struct
 import hashlib
-from typing import Dict, Any, Tuple, Optional, Callable
+from typing import Dict, Any, Tuple, Optional, Callable, Set
 
 BLOCK_SIZE = 4 * 1024 * 1024  # 4 MB blocks for Electron integrity verification
 
@@ -51,7 +52,7 @@ class AsarArchive:
 
     def list_files(self) -> Dict[str, Dict[str, Any]]:
         """Returns a flat dictionary of filepath -> file metadata."""
-        out = {}
+        out: Dict[str, Dict[str, Any]] = {}
 
         def traverse(node: Dict[str, Any], prefix: str = ""):
             if "files" in node:
@@ -64,6 +65,57 @@ class AsarArchive:
         traverse(self.header)
         return out
 
+    def list_unpacked_dirs(self) -> Set[str]:
+        """Returns a set of relative directory paths that carry `unpacked: true`."""
+        out: Set[str] = set()
+
+        def traverse(node: Dict[str, Any], prefix: str = ""):
+            if "files" in node:
+                if prefix and node.get("unpacked"):
+                    out.add(prefix)
+                for name, child in node["files"].items():
+                    if isinstance(child, dict) and "files" in child:
+                        sub = f"{prefix}/{name}" if prefix else name
+                        traverse(child, sub)
+
+        traverse(self.header)
+        return out
+
+    def read_all_entries(self) -> Tuple[Dict[str, Dict[str, Any]], Set[str]]:
+        """
+        Reads all archive entries preserving packed bytes, unpacked metadata,
+        executable flags, symlinks, and unpacked directory markers.
+        """
+        files = self.list_files()
+        unpacked_dirs = self.list_unpacked_dirs()
+        entries: Dict[str, Dict[str, Any]] = {}
+
+        with open(self.asar_path, "rb") as f:
+            for rel_path, meta in files.items():
+                if "link" in meta:
+                    entries[rel_path] = {"kind": "symlink", "link": meta["link"]}
+                elif meta.get("unpacked"):
+                    entries[rel_path] = {
+                        "kind": "unpacked",
+                        "size": int(meta.get("size", 0)),
+                        "executable": bool(meta.get("executable", False)),
+                        "integrity": meta.get("integrity"),
+                    }
+                else:
+                    offset = int(meta.get("offset", 0))
+                    size = int(meta.get("size", 0))
+                    if size > 0:
+                        f.seek(self.base_offset + offset)
+                        data = f.read(size)
+                    else:
+                        data = b""
+                    entries[rel_path] = {
+                        "kind": "packed",
+                        "data": data,
+                        "executable": bool(meta.get("executable", False)),
+                    }
+        return entries, unpacked_dirs
+
     def extract_file(self, internal_path: str) -> Optional[bytes]:
         """Extracts a single file by its relative path inside the archive."""
         parts = [p for p in internal_path.replace("\\", "/").strip("/").split("/") if p]
@@ -73,7 +125,7 @@ class AsarArchive:
                 return None
             curr = curr["files"][part]
 
-        if "offset" not in curr or "size" not in curr:
+        if curr.get("unpacked") or "offset" not in curr or "size" not in curr:
             return None
 
         offset = int(curr["offset"])
@@ -90,6 +142,8 @@ class AsarArchive:
             for rel_path, meta in files.items():
                 if filter_fn and not filter_fn(rel_path):
                     continue
+                if meta.get("unpacked") or "link" in meta:
+                    continue
                 offset = int(meta["offset"])
                 size = int(meta["size"])
                 f.seek(self.base_offset + offset)
@@ -101,53 +155,69 @@ class AsarArchive:
                     out.write(content)
 
 
-def pack_asar_from_dict(
-    files_dict: Dict[str, bytes],
+def pack_asar_from_entries(
+    entries: Dict[str, Dict[str, Any]],
     output_path: str,
+    unpacked_dirs: Optional[Set[str]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ):
     """
-    Packs a dictionary of {internal_path: bytes} into an ASAR file.
-    Automatically generates valid Electron SHA-256 integrity metadata.
+    Packs a dictionary of structured ASAR entries (`packed`, `unpacked`, `symlink`)
+    preserving unpacked directories, executable flags, and SHA-256 integrity blocks.
     """
-    # 1. Build directory tree and metadata
     header_tree: Dict[str, Any] = {"files": {}}
     current_offset = 0
+    unpacked_set = unpacked_dirs or set()
 
-    sorted_paths = sorted(files_dict.keys())
-    file_records = []
+    sorted_paths = sorted(entries.keys())
+    payloads = []
 
     for rel_path in sorted_paths:
-        data = files_dict[rel_path]
-        size = len(data)
-        integrity = compute_file_integrity(data)
-
-        # Navigate / build tree
+        entry = entries[rel_path]
         parts = [p for p in rel_path.replace("\\", "/").strip("/").split("/") if p]
+        if not parts:
+            continue
+
         curr = header_tree
+        prefix = ""
         for part in parts[:-1]:
+            prefix = f"{prefix}/{part}" if prefix else part
             if part not in curr["files"]:
                 curr["files"][part] = {"files": {}}
             curr = curr["files"][part]
+            if prefix in unpacked_set:
+                curr["unpacked"] = True
 
         filename = parts[-1]
-        curr["files"][filename] = {
-            "size": size,
-            "offset": str(current_offset),
-            "integrity": integrity,
-        }
+        kind = entry.get("kind", "packed")
+        if kind == "symlink":
+            curr["files"][filename] = {"link": entry["link"]}
+        elif kind == "unpacked":
+            meta: Dict[str, Any] = {
+                "size": int(entry.get("size", 0)),
+                "unpacked": True,
+            }
+            if entry.get("executable"):
+                meta["executable"] = True
+            if entry.get("integrity") is not None:
+                meta["integrity"] = entry["integrity"]
+            curr["files"][filename] = meta
+        else:
+            data = entry["data"]
+            size = len(data)
+            meta = {
+                "size": size,
+                "offset": str(current_offset),
+                "integrity": compute_file_integrity(data),
+            }
+            if entry.get("executable"):
+                meta["executable"] = True
+            curr["files"][filename] = meta
+            payloads.append((rel_path, data))
+            current_offset += size
 
-        file_records.append((rel_path, data, current_offset))
-        current_offset += size
-
-    # 2. Serialize header JSON
     json_bytes = json.dumps(header_tree, separators=(",", ":")).encode("utf-8")
     json_len = len(json_bytes)
-
-    # Chromium ASAR 4-byte padding alignment:
-    # Header format: [4, total_size, payload_size, json_len] + json_bytes + padding
-    # total_size = payload_size + 4
-    # base_offset = 8 + total_size
     padding = (4 - (json_len % 4)) % 4
     total_size = json_len + padding + 8
     payload_size = total_size - 4
@@ -158,17 +228,37 @@ def pack_asar_from_dict(
         + (b"\x00" * padding)
     )
 
-    # 3. Write output file
     temp_output = output_path + ".tmp"
     with open(temp_output, "wb") as out_f:
         out_f.write(header_bytes)
-
-        total_files = len(file_records)
-        for idx, (path, data, _) in enumerate(file_records, 1):
-            out_f.write(data)
+        total_files = len(payloads)
+        for idx, (rel_path, data) in enumerate(payloads, 1):
+            if data:
+                out_f.write(data)
             if progress_callback:
-                progress_callback(idx, total_files, path)
+                progress_callback(idx, total_files, rel_path)
 
     if os.path.exists(output_path):
         os.remove(output_path)
     os.rename(temp_output, output_path)
+    if os.name != "nt":
+        try:
+            os.chmod(output_path, 0o644)
+        except OSError:
+            pass
+
+
+def pack_asar_from_dict(
+    files_dict: Dict[str, bytes],
+    output_path: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+):
+    """
+    Packs a dictionary of {internal_path: bytes} into an ASAR file.
+    Automatically generates valid Electron SHA-256 integrity metadata.
+    """
+    entries = {
+        rel_path: {"kind": "packed", "data": data, "executable": False}
+        for rel_path, data in files_dict.items()
+    }
+    pack_asar_from_entries(entries, output_path, progress_callback=progress_callback)

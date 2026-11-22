@@ -1234,6 +1234,7 @@ function renderPickerHtml(port) {
         const grid = document.getElementById("grid");
         grid.innerHTML = "";
         const list = snapshot.accounts || [];
+        const isWin = snapshot.platform === "win32";
 
         for (const acc of list) {
             const st = getStatusMeta(acc, ru);
@@ -1281,11 +1282,11 @@ function renderPickerHtml(port) {
             } else {
                 ident.innerHTML =
                     '<div class="ident-name">' + esc(title) + '</div>' +
-                    '<div class="ident-email">' + esc(acc.email || (isDefault ? (ru ? "Основная сессия Windows" : "Primary Windows session") : (ru ? "Вход в Google при открытии" : "Sign in to Google on open"))) + '</div>';
+                    '<div class="ident-email">' + esc(acc.email || (isDefault ? (isWin ? (ru ? "Основная сессия Windows" : "Primary Windows session") : (ru ? "Основная сессия" : "Primary session")) : (ru ? "Вход в Google при открытии" : "Sign in to Google on open"))) + '</div>';
             }
             top.append(av, ident);
 
-            // Meta tags: Live Status + Windows User Isolation
+            // Meta tags: Live Status + Profile Isolation
             const metaRow = document.createElement("div");
             metaRow.className = "meta-row";
 
@@ -1297,6 +1298,9 @@ function renderPickerHtml(port) {
             if (isDefault) {
                 isoTag.className = "tag tag-muted";
                 isoTag.textContent = ru ? "Основной пользователь" : "Primary user";
+            } else if (!isWin) {
+                isoTag.className = "tag tag-muted";
+                isoTag.textContent = ru ? "Изолированный профиль" : "Isolated profile";
             } else if (acc.isolationReady && acc.winUser) {
                 isoTag.className = "tag tag-muted";
                 isoTag.textContent = "Windows: " + acc.winUser;
@@ -1340,7 +1344,7 @@ function renderPickerHtml(port) {
                 acts.appendChild(stopBtn);
             }
 
-            if (!isDefault && acc.isolationReady) {
+            if (isWin && !isDefault && acc.isolationReady) {
                 const folderBtn = document.createElement("button");
                 folderBtn.className = "icon-btn";
                 folderBtn.title = ru ? "Выдать этому аккаунту доступ к папке проекта" : "Grant project folder access";
@@ -1378,7 +1382,7 @@ function renderPickerHtml(port) {
                 const delBtn = document.createElement("button");
                 const confirming = confirmDelId === acc.id;
                 delBtn.className = "icon-btn danger";
-                delBtn.title = confirming ? (ru ? "Подтвердить удаление пользователя Windows и данных" : "Confirm deletion") : (ru ? "Удалить аккаунт" : "Delete account");
+                delBtn.title = confirming ? (isWin ? (ru ? "Подтвердить удаление пользователя Windows и данных" : "Confirm deletion") : (ru ? "Подтвердить удаление профиля и данных" : "Confirm deletion")) : (ru ? "Удалить аккаунт" : "Delete account");
                 delBtn.innerHTML = confirming
                     ? (ru ? "Удалить?" : "Confirm?")
                     : '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
@@ -1386,7 +1390,9 @@ function renderPickerHtml(port) {
                     e.stopPropagation();
                     if (!confirming) { confirmDelId = acc.id; render(); return; }
                     confirmDelId = null;
-                    showBanner(ru ? "Удаление изолированного профиля Windows (подтвердите UAC)..." : "Removing isolated Windows profile (confirm UAC)...");
+                    showBanner(isWin
+                        ? (ru ? "Удаление изолированного профиля Windows (подтвердите UAC)..." : "Removing isolated Windows profile (confirm UAC)...")
+                        : (ru ? "Удаление изолированного профиля и данных..." : "Removing isolated profile and data..."));
                     fetch(BASE_URL + "/accounts/delete", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
@@ -1421,9 +1427,14 @@ function renderPickerHtml(port) {
         const label = inp.value.trim();
         inp.value = "";
         btn.disabled = true;
-        showBanner(ru
-            ? "Создание изолированного пользователя Windows... Это занимает 5–15 секунд, не закрывайте окно. Подтвердите запрос UAC, если он появился."
-            : "Provisioning isolated Windows user... This takes 5–15 seconds. Confirm the UAC prompt if shown.", false, true);
+        const isWin = snapshot.platform === "win32";
+        showBanner(isWin
+            ? (ru
+                ? "Создание изолированного пользователя Windows... Это занимает 5–15 секунд, не закрывайте окно. Подтвердите запрос UAC, если он появился."
+                : "Provisioning isolated Windows user... This takes 5–15 seconds. Confirm the UAC prompt if shown.")
+            : (ru
+                ? "Создание изолированного профиля и запуск сервера аккаунта..."
+                : "Creating isolated profile and starting account server..."), false, true);
         const slowHint = setTimeout(() => {
             if (btn.disabled) {
                 showBanner(ru

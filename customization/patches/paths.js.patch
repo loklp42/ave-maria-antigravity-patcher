@@ -15,14 +15,23 @@
  exports.getAppDataDirName = getAppDataDirName;
  exports.getAppDataDir = getAppDataDir;
  exports.getSettingsPbPath = getSettingsPbPath;
-@@ -51,6 +59,135 @@
+@@ -51,6 +59,144 @@
  const path_1 = __importDefault(require("path"));
  const os_1 = __importDefault(require("os"));
  const constants_1 = require("./constants");
 +let _runtimeProfileOverride = null;
++function getFallbackAppDataDir() {
++    if (process.platform === 'win32') {
++        return process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
++    }
++    if (process.platform === 'darwin') {
++        return path_1.default.join(os_1.default.homedir(), 'Library', 'Application Support');
++    }
++    return process.env.XDG_CONFIG_HOME || path_1.default.join(os_1.default.homedir(), '.config');
++}
 +function getActiveProfileFilePath() {
 +    try {
-+        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
++        const appData = electron_1.app?.getPath?.('appData') || getFallbackAppDataDir();
 +        return path_1.default.join(appData, 'agy_active_profile.json');
 +    }
 +    catch {
@@ -98,11 +107,11 @@
 +}
 +function getSharedConfigDir() {
 +    try {
-+        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
++        const appData = electron_1.app?.getPath?.('appData') || getFallbackAppDataDir();
 +        return path_1.default.join(appData, 'Antigravity');
 +    }
 +    catch {
-+        return electron_1.app?.getPath?.('userData') || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming', 'Antigravity');
++        return electron_1.app?.getPath?.('userData') || path_1.default.join(getFallbackAppDataDir(), 'Antigravity');
 +    }
 +}
 +function getGeminiDirForProfile(profileId, explicitDir) {
@@ -151,7 +160,7 @@
  function getAppDataDirName() {
      if (!electron_1.app.isPackaged) {
          return 'antigravity-dev';
-@@ -58,10 +195,10 @@
+@@ -58,10 +204,10 @@
      return electron_1.app.getName().toLowerCase().replace(/\s+/g, '');
  }
  function getAppDataDir() {
@@ -164,7 +173,7 @@
  }
  /**
   * Returns the path to the persistent app storage file.
-@@ -128,8 +265,12 @@
+@@ -128,8 +274,12 @@
          // Missing file, foreign filesystem, or partial fs mock: leave as is.
      }
  }

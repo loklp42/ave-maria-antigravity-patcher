@@ -14,13 +14,18 @@ function testSyntax(relPath) {
     new vm.Script(code, { filename: relPath });
 }
 
-console.log("[1/4] Checking JS syntax of all modified modules...");
+console.log("[1/5] Checking JS syntax of all modified modules...");
 for (const f of [
     "customization/modules/agyExtras.js",
+    "customization/modules/agyMediaDaemon.js",
+    "customization/modules/agyAccounts.js",
+    "customization/modules/agyShellViews.js",
+    "customization/modules/agyWinUserIsolation.js",
     "customization/modules/wallpaperEngine.js",
     "customization/modules/agyI18n.js",
     "customization/modules/agyTabManager.js",
     "customization/patched_system/languageServer.js",
+    "customization/patched_system/paths.js",
 ]) {
     testSyntax(f);
 }
@@ -275,5 +280,24 @@ sm4.enterInfoZone();
 assert.strictEqual(sm4.state().cardOpen, true);
 sm4.setHoverPref(false);
 assert.strictEqual(sm4.state().cardOpen, false);
+
+console.log("[5/5] Testing Linux MPRIS2 / audio helpers in agyMediaDaemon.js...");
+const mediaMod = require(path.join(ROOT, "customization/modules/agyMediaDaemon.js"));
+const gdbusSample = `({'PlaybackStatus': <'Playing'>, 'Position': <int64 42500000>, 'CanSeek': <true>, 'CanGoNext': <true>, 'CanGoPrevious': <true>, 'Metadata': <{'mpris:trackid': <objectpath '/org/mpris/MediaPlayer2/track/1'>, 'mpris:length': <uint64 210000000>, 'mpris:artUrl': <'file:///tmp/cover.jpg'>, 'xesam:title': <'Midnight City'>, 'xesam:album': <'Hurry Up'>, 'xesam:artist': <['M83', 'Guest']>}>},)`;
+const parsedMpris = mediaMod._test.parseGdbusPlayerProps(gdbusSample);
+assert.strictEqual(parsedMpris.status, "Playing");
+assert.strictEqual(parsedMpris.title, "Midnight City");
+assert.strictEqual(parsedMpris.artist, "M83, Guest");
+assert.strictEqual(parsedMpris.album, "Hurry Up");
+assert.strictEqual(parsedMpris.artUrl, "file:///tmp/cover.jpg");
+assert.strictEqual(parsedMpris.posSec, 42.5);
+assert.strictEqual(parsedMpris.durSec, 210);
+assert.strictEqual(mediaMod._test.getLinuxAppDisplayName("org.mpris.MediaPlayer2.spotify"), "Spotify");
+assert.strictEqual(mediaMod._test.getLinuxAppDisplayName("org.mpris.MediaPlayer2.yandex-music"), "Яндекс Музыка");
+assert.strictEqual(mediaMod._test.matchesLinuxAudioApp("org.mpris.MediaPlayer2.spotify", 'application.name = "Spotify"'), true);
+assert.ok(
+    mediaMod._test.scoreLinuxSession("spotify", "Song", "Playing", 180, "") >
+    mediaMod._test.scoreLinuxSession("firefox", "Video", "Paused", 180, "")
+);
 
 console.log("ALL MODULE BEHAVIOR TESTS PASSED!");

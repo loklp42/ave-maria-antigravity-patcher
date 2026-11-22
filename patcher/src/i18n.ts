@@ -59,7 +59,7 @@ export const STRINGS = {
       },
       media: {
         title: "Медиаплеер и караоке",
-        desc: "Управление музыкой из Windows, тексты песен и визуализатор",
+        desc: "Системное управление музыкой (SMTC / MPRIS), тексты и визуализатор",
       },
       context: {
         title: "Индикатор памяти чата",
@@ -132,7 +132,7 @@ export const STRINGS = {
       },
       media: {
         title: "Media player & karaoke",
-        desc: "Windows media controls, synced lyrics, and audio visualizer",
+        desc: "System media controls (SMTC / MPRIS), synced lyrics, and visualizer",
       },
       context: {
         title: "Chat memory indicator",

@@ -124,13 +124,7 @@ fn open_custom_wallpapers() -> Result<String, String> {
     let custom_dir = cust.parent().unwrap_or(&cust).join("custom_wallpapers");
     std::fs::create_dir_all(&custom_dir)
         .map_err(|e| format!("Не удалось создать папку custom_wallpapers: {e}"))?;
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer")
-            .arg(&custom_dir)
-            .spawn()
-            .map_err(|e| format!("Не удалось открыть проводник: {e}"))?;
-    }
+    system::open_folder_in_file_manager(&custom_dir)?;
     Ok(custom_dir.to_string_lossy().to_string())
 }
 

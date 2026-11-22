@@ -60,9 +60,18 @@ const path_1 = __importDefault(require("path"));
 const os_1 = __importDefault(require("os"));
 const constants_1 = require("./constants");
 let _runtimeProfileOverride = null;
+function getFallbackAppDataDir() {
+    if (process.platform === 'win32') {
+        return process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
+    }
+    if (process.platform === 'darwin') {
+        return path_1.default.join(os_1.default.homedir(), 'Library', 'Application Support');
+    }
+    return process.env.XDG_CONFIG_HOME || path_1.default.join(os_1.default.homedir(), '.config');
+}
 function getActiveProfileFilePath() {
     try {
-        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
+        const appData = electron_1.app?.getPath?.('appData') || getFallbackAppDataDir();
         return path_1.default.join(appData, 'agy_active_profile.json');
     }
     catch {
@@ -138,11 +147,11 @@ function normalizeProfilePathId(raw) {
 }
 function getSharedConfigDir() {
     try {
-        const appData = electron_1.app?.getPath?.('appData') || process.env.APPDATA || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming');
+        const appData = electron_1.app?.getPath?.('appData') || getFallbackAppDataDir();
         return path_1.default.join(appData, 'Antigravity');
     }
     catch {
-        return electron_1.app?.getPath?.('userData') || path_1.default.join(os_1.default.homedir(), 'AppData', 'Roaming', 'Antigravity');
+        return electron_1.app?.getPath?.('userData') || path_1.default.join(getFallbackAppDataDir(), 'Antigravity');
     }
 }
 function getGeminiDirForProfile(profileId, explicitDir) {

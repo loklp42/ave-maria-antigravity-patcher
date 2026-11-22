@@ -23,7 +23,13 @@ function getAppDataRoot() {
     if (electronApp && typeof electronApp.getPath === "function") {
         try { return electronApp.getPath("appData"); } catch {}
     }
-    return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    if (process.platform === "win32") {
+        return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    }
+    if (process.platform === "darwin") {
+        return path.join(os.homedir(), "Library", "Application Support");
+    }
+    return process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 }
 
 function getAccountsFile() {
@@ -85,7 +91,9 @@ function serializeAccount(account) {
     const isDefault = id === "default";
     const isolationMode = isDefault
         ? "native"
-        : (account.isolationMode === "winuser" || account.winUser ? "winuser" : (process.platform === "win32" ? "winuser" : "legacy"));
+        : (process.platform === "win32"
+            ? (account.isolationMode === "winuser" || account.winUser ? "winuser" : "winuser")
+            : "profile");
     const winUser = isDefault ? "" : (typeof account.winUser === "string" ? account.winUser.trim() : "");
     const geminiDir = isDefault
         ? ""
@@ -245,11 +253,13 @@ function decorateAccounts(list) {
         const tabOpen = openTabsSet.has(account.id) || rt.tabOpen;
         const isolationReady = account.id === "default"
             ? true
-            : Boolean(
-                account.winUser &&
-                winIsolation &&
-                winIsolation.isIsolatedAccountProvisionedSync(account.id, account.winUser)
-            );
+            : (process.platform === "win32"
+                ? Boolean(
+                    account.winUser &&
+                    winIsolation &&
+                    winIsolation.isIsolatedAccountProvisionedSync(account.id, account.winUser)
+                )
+                : true);
         let status = rt.status;
         if (status !== "starting" && status !== "error") {
             if (!lsRunning && !tabOpen) status = "stopped";
@@ -448,7 +458,7 @@ async function addAccount(customLabel = "", openInNewWindow = false, opts = {}) 
         displayName: "",
         email: "",
         avatar: "",
-        isolationMode: winUser ? "winuser" : "legacy",
+        isolationMode: winUser ? "winuser" : (process.platform === "win32" ? "legacy" : "profile"),
         winUser,
         geminiDir,
         createdAt: Date.now(),

@@ -68,6 +68,7 @@ pub struct PatcherStatus {
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticsResult {
     pub write_permission: bool,
+    pub can_elevate: bool,
     pub dry_run_passed: bool,
     pub errors: Vec<String>,
     pub backup_exists: bool,
@@ -107,6 +108,26 @@ pub fn locate_customization_dir() -> Option<PathBuf> {
                     return Some(candidate);
                 }
                 dir = d.parent().map(Path::to_path_buf);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut linux_fallbacks = vec![
+            PathBuf::from("/usr/share/ave-maria-patcher/customization"),
+            PathBuf::from("/usr/local/share/ave-maria-patcher/customization"),
+        ];
+        if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+            if !xdg_data.trim().is_empty() {
+                linux_fallbacks.push(PathBuf::from(xdg_data).join("ave-maria-patcher/customization"));
+            }
+        } else if let Some(home) = system::unix_user_home() {
+            linux_fallbacks.push(home.join(".local/share/ave-maria-patcher/customization"));
+        }
+        for candidate in linux_fallbacks {
+            if candidate.join("modules").is_dir() && candidate.join("patched_system").is_dir() {
+                return Some(candidate);
             }
         }
     }
@@ -241,11 +262,18 @@ pub fn dry_run(ag_dir: &str) -> DiagnosticsResult {
 
     DiagnosticsResult {
         write_permission,
+        can_elevate: !write_permission && system::can_elevate(),
         dry_run_passed: errors.is_empty(),
         errors,
         backup_exists: orig_path.exists(),
         running_processes: system::get_running_processes(),
     }
+}
+
+#[cfg(unix)]
+fn set_readable_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o644));
 }
 
 pub fn apply_patch<F>(opts: &ModuleOptions, emit: F) -> Result<(), String>
@@ -262,7 +290,11 @@ where
     if !diag.dry_run_passed {
         return Err(diag.errors.join("\n"));
     }
-    if !diag.write_permission {
+    let needs_elevation = !diag.write_permission;
+    if needs_elevation && !diag.can_elevate {
+        #[cfg(target_os = "linux")]
+        return Err("Нет прав на запись в каталог resources/. Установите polkit (pkexec) или запустите патчер с правами суперпользователя.".to_string());
+        #[cfg(not(target_os = "linux"))]
         return Err("Нет прав на запись в каталог resources/. Запустите от имени администратора.".to_string());
     }
 
@@ -283,14 +315,23 @@ where
         return Err("Файл app.asar заблокирован другим процессом.".to_string());
     }
 
-    if !orig_path.exists() {
+    if !needs_elevation && !orig_path.exists() {
         emit("Создание резервной копии app.asar.orig...", 32, "info");
         fs::copy(&asar_path, &orig_path)
             .map_err(|e| format!("Ошибка создания резервной копии: {e}"))?;
+        #[cfg(unix)]
+        set_readable_mode(&orig_path);
     }
 
-    emit("Чтение оригинального архива app.asar.orig...", 48, "info");
-    let archive = AsarArchive::open(&orig_path)?;
+    let source_asar = if orig_path.exists() {
+        &orig_path
+    } else {
+        &asar_path
+    };
+
+    emit("Чтение оригинального архива...", 48, "info");
+    let archive = AsarArchive::open(source_asar)?;
+    let unpacked_dirs = archive.read_unpacked_dirs();
     let mut entries = archive.read_all_entries()?;
 
     emit("Инъекция модулей и патчей...", 64, "info");
@@ -331,25 +372,78 @@ where
         );
     }
 
-    emit("Упаковка нового архива app.asar (SHA-256)...", 82, "info");
-    asar::write_asar(&new_path, &entries)?;
+    let orig_sha = asar::sha256_file(source_asar).unwrap_or_default();
 
-    emit("Атомарная замена app.asar...", 93, "info");
-    if swap_bak.exists() {
+    if needs_elevation {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::process::id();
+            let staged_asar = std::env::temp_dir().join(format!("agy_patch_{pid}.asar"));
+            let staged_manifest = std::env::temp_dir().join(format!("agy_manifest_{pid}.json"));
+
+            emit("Упаковка нового архива app.asar (SHA-256)...", 80, "info");
+            asar::write_asar_with_unpacked_dirs(&staged_asar, &entries, &unpacked_dirs)?;
+
+            let target_sha = asar::sha256_file(&staged_asar).unwrap_or_default();
+            let manifest = build_manifest_json(ag_dir, opts, &orig_sha, &target_sha);
+            let _ = fs::write(
+                &staged_manifest,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+
+            emit("Запрос прав администратора (pkexec) для замены app.asar...", 92, "info");
+            let swap_res = system::elevated_install_asar(&res_dir, &staged_asar, &staged_manifest);
+            let _ = fs::remove_file(&staged_asar);
+            let _ = fs::remove_file(&staged_manifest);
+            swap_res?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err("Нет прав на запись в каталог resources/.".to_string());
+        }
+    } else {
+        emit("Упаковка нового архива app.asar (SHA-256)...", 82, "info");
+        asar::write_asar_with_unpacked_dirs(&new_path, &entries, &unpacked_dirs)?;
+
+        emit("Атомарная замена app.asar...", 93, "info");
+        if swap_bak.exists() {
+            let _ = fs::remove_file(&swap_bak);
+        }
+        fs::rename(&asar_path, &swap_bak)
+            .map_err(|e| format!("Ошибка подготовки замены app.asar: {e}"))?;
+
+        if let Err(e) = fs::rename(&new_path, &asar_path) {
+            let _ = fs::rename(&swap_bak, &asar_path);
+            return Err(format!("Ошибка замены app.asar (выполнен откат): {e}"));
+        }
         let _ = fs::remove_file(&swap_bak);
-    }
-    fs::rename(&asar_path, &swap_bak)
-        .map_err(|e| format!("Ошибка подготовки замены app.asar: {e}"))?;
+        #[cfg(unix)]
+        set_readable_mode(&asar_path);
 
-    if let Err(e) = fs::rename(&new_path, &asar_path) {
-        let _ = fs::rename(&swap_bak, &asar_path);
-        return Err(format!("Ошибка замены app.asar (выполнен откат): {e}"));
+        let target_sha = asar::sha256_file(&asar_path).unwrap_or_default();
+        let manifest = build_manifest_json(ag_dir, opts, &orig_sha, &target_sha);
+        let _ = fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+        );
+        #[cfg(unix)]
+        set_readable_mode(&manifest_path);
     }
-    let _ = fs::remove_file(&swap_bak);
 
-    let orig_sha = asar::sha256_file(&orig_path).unwrap_or_default();
-    let target_sha = asar::sha256_file(&asar_path).unwrap_or_default();
-    let manifest = json!({
+    // Sync custom_wallpapers/ folder and user component toggles directly into Antigravity's shared configs
+    sync_user_configs(&cust_dir, opts);
+
+    emit("Патч успешно установлен.", 100, "success");
+    Ok(())
+}
+
+fn build_manifest_json(
+    ag_dir: &str,
+    opts: &ModuleOptions,
+    orig_sha: &str,
+    target_sha: &str,
+) -> serde_json::Value {
+    json!({
         "patcher": "Ave Maria Antigravity Patcher",
         "version": "2.34.0",
         "installed_at": Utc::now().to_rfc3339(),
@@ -364,17 +458,7 @@ where
         },
         "orig_sha256": orig_sha,
         "target_sha256": target_sha
-    });
-    let _ = fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-    );
-
-    // Sync custom_wallpapers/ folder and user component toggles directly into Antigravity's shared configs
-    sync_user_configs(&cust_dir, opts);
-
-    emit("Патч успешно установлен.", 100, "success");
-    Ok(())
+    })
 }
 
 fn merge_json_file(path: &Path, updates: &[(&str, serde_json::Value)]) {
@@ -398,11 +482,10 @@ fn sync_user_configs(cust_dir: &Path, opts: &ModuleOptions) {
         .join("custom_wallpapers");
     let _ = fs::create_dir_all(&custom_dir);
 
-    let Ok(appdata) = std::env::var("APPDATA") else {
+    let Some(config_dir) = system::get_antigravity_config_dir() else {
         return;
     };
-    let shared_dir = PathBuf::from(appdata).join("Antigravity").join("Shared");
-    let _ = fs::create_dir_all(&shared_dir);
+    let _ = fs::create_dir_all(&config_dir);
 
     // 1. wallpaper_config.json (custom photos/videos + Steam Workshop dir)
     let mut wp_updates = vec![(
@@ -415,12 +498,12 @@ fn sync_user_configs(cust_dir: &Path, opts: &ModuleOptions) {
             serde_json::Value::String(opts.wallpaper_dir.trim().to_string()),
         ));
     }
-    merge_json_file(&shared_dir.join("wallpaper_config.json"), &wp_updates);
+    merge_json_file(&config_dir.join("wallpaper_config.json"), &wp_updates);
 
     // 2. agy_extras_settings.json (player, context indicator, language)
     let lang_val = serde_json::Value::String(if opts.i18n { "ru" } else { "en" }.to_string());
     merge_json_file(
-        &shared_dir.join("agy_extras_settings.json"),
+        &config_dir.join("agy_extras_settings.json"),
         &[
             ("showPlayer", serde_json::Value::Bool(opts.media)),
             ("showContextRing", serde_json::Value::Bool(opts.context)),
@@ -430,7 +513,7 @@ fn sync_user_configs(cust_dir: &Path, opts: &ModuleOptions) {
 
     // 3. agy_appearance.json (language + multi-account top tab bar)
     merge_json_file(
-        &shared_dir.join("agy_appearance.json"),
+        &config_dir.join("agy_appearance.json"),
         &[
             ("lang", lang_val),
             ("showTopTabBar", serde_json::Value::Bool(opts.accounts)),
@@ -465,6 +548,14 @@ where
         return Err("Файл app.asar не найден.".to_string());
     }
 
+    let needs_elevation = !system::check_write_permission(&res_dir);
+    if needs_elevation && !system::can_elevate() {
+        #[cfg(target_os = "linux")]
+        return Err("Нет прав на запись в каталог resources/. Установите polkit (pkexec) или запустите патчер с правами суперпользователя.".to_string());
+        #[cfg(not(target_os = "linux"))]
+        return Err("Нет прав на запись в каталог resources/. Запустите от имени администратора.".to_string());
+    }
+
     emit("Остановка процессов Antigravity...", 20, "info");
     if !system::terminate_antigravity_processes() {
         return Err("Не удалось завершить процессы Antigravity.".to_string());
@@ -480,9 +571,23 @@ where
             .unwrap_or(false);
 
     if orig_is_clean {
-        emit("Восстановление оригинального app.asar из бэкапа...", 70, "info");
-        fs::copy(&orig_path, &asar_path)
-            .map_err(|e| format!("Ошибка восстановления оригинала: {e}"))?;
+        if needs_elevation {
+            #[cfg(target_os = "linux")]
+            {
+                emit("Запрос прав администратора (pkexec) для восстановления app.asar...", 75, "info");
+                system::elevated_restore_asar(&res_dir, None)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err("Нет прав на запись в каталог resources/.".to_string());
+            }
+        } else {
+            emit("Восстановление оригинального app.asar из бэкапа...", 70, "info");
+            fs::copy(&orig_path, &asar_path)
+                .map_err(|e| format!("Ошибка восстановления оригинала: {e}"))?;
+            #[cfg(unix)]
+            set_readable_mode(&asar_path);
+        }
     } else {
         // Backup is missing or was captured from an already-patched app.asar:
         // strip all autonomous modules and restore all 13 stock system files from customization/original_system/.
@@ -496,6 +601,7 @@ where
         emit("Очистка патча и восстановление стандартных файлов...", 45, "info");
         let source = if asar_path.exists() { &asar_path } else { &orig_path };
         let archive = AsarArchive::open(source)?;
+        let unpacked_dirs = archive.read_unpacked_dirs();
         let mut entries = archive.read_all_entries()?;
 
         for m in AUTONOMOUS_MODULES {
@@ -517,29 +623,52 @@ where
             );
         }
 
-        emit("Сборка чистого оригинального app.asar...", 75, "info");
-        asar::write_asar(&new_path, &entries)?;
+        if needs_elevation {
+            #[cfg(target_os = "linux")]
+            {
+                let pid = std::process::id();
+                let staged_clean = std::env::temp_dir().join(format!("agy_restore_{pid}.asar"));
+                emit("Сборка чистого оригинального app.asar...", 75, "info");
+                asar::write_asar_with_unpacked_dirs(&staged_clean, &entries, &unpacked_dirs)?;
 
-        emit("Замена app.asar...", 90, "info");
-        if swap_bak.exists() {
-            let _ = fs::remove_file(&swap_bak);
-        }
-        if asar_path.exists() {
-            fs::rename(&asar_path, &swap_bak)
-                .map_err(|e| format!("Ошибка подготовки замены app.asar: {e}"))?;
-        }
-        if let Err(e) = fs::rename(&new_path, &asar_path) {
-            if swap_bak.exists() {
-                let _ = fs::rename(&swap_bak, &asar_path);
+                emit("Запрос прав администратора (pkexec) для восстановления app.asar...", 90, "info");
+                let res = system::elevated_restore_asar(&res_dir, Some(&staged_clean));
+                let _ = fs::remove_file(&staged_clean);
+                res?;
             }
-            return Err(format!("Ошибка замены app.asar: {e}"));
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err("Нет прав на запись в каталог resources/.".to_string());
+            }
+        } else {
+            emit("Сборка чистого оригинального app.asar...", 75, "info");
+            asar::write_asar_with_unpacked_dirs(&new_path, &entries, &unpacked_dirs)?;
+
+            emit("Замена app.asar...", 90, "info");
+            if swap_bak.exists() {
+                let _ = fs::remove_file(&swap_bak);
+            }
+            if asar_path.exists() {
+                fs::rename(&asar_path, &swap_bak)
+                    .map_err(|e| format!("Ошибка подготовки замены app.asar: {e}"))?;
+            }
+            if let Err(e) = fs::rename(&new_path, &asar_path) {
+                if swap_bak.exists() {
+                    let _ = fs::rename(&swap_bak, &asar_path);
+                }
+                return Err(format!("Ошибка замены app.asar: {e}"));
+            }
+            let _ = fs::remove_file(&swap_bak);
+            #[cfg(unix)]
+            set_readable_mode(&asar_path);
+            // Save the freshly reconstructed clean stock archive as app.asar.orig for future use.
+            let _ = fs::copy(&asar_path, &orig_path);
+            #[cfg(unix)]
+            set_readable_mode(&orig_path);
         }
-        let _ = fs::remove_file(&swap_bak);
-        // Save the freshly reconstructed clean stock archive as app.asar.orig for future use.
-        let _ = fs::copy(&asar_path, &orig_path);
     }
 
-    if manifest_path.exists() {
+    if !needs_elevation && manifest_path.exists() {
         let _ = fs::remove_file(&manifest_path);
     }
 

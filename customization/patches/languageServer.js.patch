@@ -111,11 +111,20 @@
  /** Returns the active language server process, or null if not running. */
  function getLsProcess() {
      return _lsProcess;
-@@ -234,14 +321,23 @@
+@@ -215,6 +302,7 @@
+ // SIGTERM killed the app without running before-quit (so the language server
+ // was not shut down).
+ const shellEnvReads = new loginShellEnvReads_1.LoginShellEnvReads(false);
++let _cachedShellEnv = null;
+ /**
+  * Starts loading the login-shell env (spawns an interactive shell, which can
+  * take seconds with heavy rc files) so it overlaps app startup instead of
+@@ -234,14 +322,28 @@
   * crashes that occur after startup.
   */
  async function startLanguageServer(port, csrf, options = {}) {
 -    const { headless, hostBridgeUrl, hostBridgeToken, wsl } = options;
+-    const loginShellEnv = await shellEnvReads.take();
 +    const { headless, hostBridgeUrl, hostBridgeToken, wsl, profileId, winUser, geminiDir: explicitGeminiDir } = options;
 +    const profileKey = normalizeProfileKey(profileId !== undefined ? profileId : (0, paths_1.getActiveProfileName)());
 +    const profileArg = profileKey === 'default' ? '' : profileKey;
@@ -124,7 +133,12 @@
 +        ? (explicitGeminiDir || (useWinIsolation ? winIsolation.getIsolatedGeminiDir(profileArg) : (0, paths_1.getGeminiDirForProfile)(profileArg)))
 +        : '';
 +    const isForActive = profileKey === getActiveProfileKey();
-     const loginShellEnv = await shellEnvReads.take();
++    const loginShellEnv = _cachedShellEnv !== null
++        ? _cachedShellEnv
++        : await shellEnvReads.take();
++    if (_cachedShellEnv === null) {
++        _cachedShellEnv = loginShellEnv;
++    }
      if (_intentionalTermination) {
          throw new Error('Language server startup aborted during shutdown');
      }
@@ -138,7 +152,7 @@
          // We need to pass the override flags because the LS is running in standalone mode.
          // Secrets (CSRF token and host bridge token) are passed via child env / stdin
          // rather than CLI argv so they are never exposed in `ps` or `/proc/<pid>/cmdline`.
-@@ -249,10 +345,15 @@
+@@ -249,10 +351,15 @@
              ...(0, lsDefaults_1.baseLsArgs)({
                  ideVersion: electron_1.app.getVersion(),
                  httpsServerPort: port,
@@ -155,7 +169,7 @@
          // Point the LS at the main process' host bridge server. The LS tolerates
          // these being absent, but we always pass them when the server is up.
          const hasHostBridgeToken = Boolean(hostBridgeUrl && hostBridgeToken);
-@@ -264,7 +365,7 @@
+@@ -264,7 +371,7 @@
          }
          let spawnCmd = exports.LS_BINARY;
          let spawnArgs = args;
@@ -164,16 +178,30 @@
              // ANTIGRAVITY_VSCODE_HOST=1 makes the LS print sign-in URLs
              // --exit_on_stdin_close ties the LS lifetime to our stdin pipe
              args.push('--exit_on_stdin_close');
-@@ -276,7 +377,7 @@
+@@ -276,7 +383,21 @@
          const env = { ...process.env, ...loginShellEnv };
          env['ANTIGRAVITY_SERVER_CSRF_TOKEN'] = csrf;
          env['AGY_REQUIRE_AUTHENTICATED_UI_BOOTSTRAP'] = '1';
 -        if (wsl) {
++        if (!isWindows && profileArg && resolvedGeminiDir) {
++            const xdgBase = path_1.default.join(resolvedGeminiDir, '.xdg');
++            const xdgConfig = path_1.default.join(xdgBase, 'config');
++            const xdgData = path_1.default.join(xdgBase, 'data');
++            const xdgCache = path_1.default.join(xdgBase, 'cache');
++            const xdgState = path_1.default.join(xdgBase, 'state');
++            for (const dir of [xdgConfig, xdgData, xdgCache, xdgState]) {
++                try { fs.mkdirSync(dir, { recursive: true }); } catch {}
++            }
++            env['XDG_CONFIG_HOME'] = xdgConfig;
++            env['XDG_DATA_HOME'] = xdgData;
++            env['XDG_CACHE_HOME'] = xdgCache;
++            env['XDG_STATE_HOME'] = xdgState;
++        }
 +        if (wsl && !useWinIsolation) {
              (0, authBootstrap_1.appendWslAuthEnvForwarding)(env);
          }
          if (electron_1.app.commandLine?.hasSwitch?.('remote-debugging-port')) {
-@@ -287,7 +388,9 @@
+@@ -287,7 +408,9 @@
              delete env['AGY_BROWSER_ACTIVE_PORT_FILE'];
              delete env['AGY_BROWSER_WS_URL'];
          }
@@ -184,7 +212,7 @@
          setupNodeModules(env, [
              {
                  name: 'chrome-devtools-mcp',
-@@ -300,43 +403,74 @@
+@@ -300,43 +423,74 @@
          env['CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY'] = '1';
          env['CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS'] = '1';
          env['CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS'] = '1';
@@ -289,7 +317,7 @@
              const str = data.toString();
              stderrChunks.push(str);
              stderrLength += str.length;
-@@ -349,6 +483,7 @@
+@@ -349,6 +503,7 @@
          const timer = setTimeout(() => {
              if (!resolved) {
                  resolved = true;
@@ -297,7 +325,7 @@
                  reject(new Error(`Timeout: language server did not report its port within ${LS_STARTUP_TIMEOUT_MS / 1000}s`));
              }
          }, LS_STARTUP_TIMEOUT_MS);
-@@ -369,11 +504,15 @@
+@@ -369,11 +524,15 @@
                      resolved = true;
                      clearTimeout(timer);
                      const actualPort = parseInt(m[1], 10);
@@ -315,7 +343,7 @@
                      });
                  }
              }
-@@ -393,11 +532,14 @@
+@@ -393,11 +552,14 @@
          });
          // Exit promise — resolves whenever the process exits (whether during
          // startup or after). Includes crash stack trace extraction.
@@ -331,7 +359,7 @@
                  }
                  if (!logStreamEnded) {
                      logStreamEnded = true;
-@@ -425,78 +567,307 @@
+@@ -425,78 +587,307 @@
   * Resolves with the handle on first successful startup.
   */
  async function startAndMonitorLanguageServer(port, csrf, options = {}) {
@@ -676,7 +704,7 @@
  }
  async function killLanguageServer() {
      setIntentionalTermination(true);
-@@ -504,54 +875,23 @@
+@@ -504,54 +895,23 @@
          return _killLsPromise;
      }
      _killLsPromise = (async () => {
@@ -746,7 +774,7 @@
          clearLsProcess();
      })().finally(() => {
          clearLsProcess();
-@@ -564,8 +904,13 @@
+@@ -564,8 +924,13 @@
   * Sets up certificate verification in Electron to trust local connections
   * (127.0.0.1 or localhost) used by the language server.
   */
@@ -762,7 +790,7 @@
          if (request.hostname === '127.0.0.1' || request.hostname === 'localhost') {
              callback(0); // Accept
          }
-@@ -574,3 +919,6 @@
+@@ -574,3 +939,6 @@
          }
      });
  }

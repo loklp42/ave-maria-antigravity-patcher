@@ -28,6 +28,7 @@ export interface ModuleOptions {
 
 export interface DiagnosticsResult {
   writePermission: boolean;
+  canElevate?: boolean;
   dryRunPassed: boolean;
   errors: string[];
   backupExists: boolean;

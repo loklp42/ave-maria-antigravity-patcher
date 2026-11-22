@@ -292,7 +292,7 @@ export default function App() {
     try {
       const res = await invoke<DiagnosticsResult>("run_diagnostics");
       setDiag(res);
-      if (res.dryRunPassed && res.writePermission) {
+      if (res.dryRunPassed && (res.writePermission || res.canElevate)) {
         pushLog(t.diagOk, "success");
       } else {
         for (const e of res.errors) {
@@ -689,8 +689,8 @@ export default function App() {
               <div className="diag-bar">
                 <span className="diag-item">
                   {t.writeAccess}{" "}
-                  <b className={diag.writePermission ? "ok" : "err"}>
-                    {diag.writePermission ? t.ok : t.noAccess}
+                  <b className={diag.writePermission || diag.canElevate ? "ok" : "err"}>
+                    {diag.writePermission ? t.ok : diag.canElevate ? "pkexec" : t.noAccess}
                   </b>
                 </span>
                 <span className="diag-item">

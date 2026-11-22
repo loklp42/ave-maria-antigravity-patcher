@@ -1,8 +1,9 @@
 "use strict";
 const https = require("https");
+const http = require("http");
 const crypto = require("crypto");
 const readline = require("readline");
-const { spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -931,7 +932,588 @@ class MediaDaemon {
     }
 }
 
-const daemon = new MediaDaemon();
+// =========================================================================
+// Linux Native Media Daemon (MPRIS2 over D-Bus + PipeWire / PulseAudio)
+// =========================================================================
+
+function runCmdLinux(cmd, args, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+        execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, encoding: "utf8" }, (err, stdout, stderr) => {
+            resolve({
+                ok: !err,
+                code: err ? (err.code ?? 1) : 0,
+                stdout: String(stdout || ""),
+                stderr: String(stderr || ""),
+            });
+        });
+    });
+}
+
+function getLinuxAppDisplayName(appId) {
+    const a = String(appId || "").toLowerCase();
+    if (/yandex/.test(a)) return "Яндекс Музыка";
+    if (/spotify/.test(a)) return "Spotify";
+    if (/applemusic|itunes/.test(a)) return "Apple Music";
+    if (/chromium|chrome/.test(a)) return "Chrome";
+    if (/msedge|edge/.test(a)) return "Edge";
+    if (/firefox|zen|librewolf/.test(a)) return "Firefox";
+    if (/opera/.test(a)) return "Opera";
+    if (/brave/.test(a)) return "Brave";
+    if (/vivaldi/.test(a)) return "Vivaldi";
+    if (/vlc/.test(a)) return "VLC";
+    if (/mpv/.test(a)) return "mpv";
+    if (/rhythmbox/.test(a)) return "Rhythmbox";
+    if (/audacious/.test(a)) return "Audacious";
+    if (/strawberry|clementine/.test(a)) return "Strawberry";
+    if (/elisa/.test(a)) return "Elisa";
+    if (/amberol/.test(a)) return "Amberol";
+    if (/tidal/.test(a)) return "TIDAL";
+    if (/deezer/.test(a)) return "Deezer";
+    if (/vk|boom/.test(a)) return "VK Музыка";
+    if (/ayugram|telegram/.test(a)) return "Telegram";
+    if (/discord|vesktop/.test(a)) return "Discord";
+    const clean = String(appId || "").replace(/^org\.mpris\.MediaPlayer2\./i, "").split(".")[0];
+    return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : "Медиа";
+}
+
+function scoreLinuxSession(appId, title, status, durSec, pin) {
+    let score = 0;
+    const a = String(appId || "").toLowerCase();
+    const st = String(status || "");
+    if (pin && appId === pin) score += 500;
+    if (st === "Playing") score += 120;
+    else if (st === "Paused") score += 55;
+    else if (st === "Stopped") score -= 30;
+    if (/yandex|spotify|applemusic|rhythmbox|audacious|strawberry|clementine|elisa|amberol|tidal|deezer|music/.test(a)) score += 40;
+    else if (/chrome|chromium|edge|firefox|opera|brave|vivaldi|vlc|mpv/.test(a)) score += 22;
+    else if (/ayugram|telegram|discord|vesktop|whatsapp|viber/.test(a)) {
+        if (st !== "Playing") score -= 80;
+    }
+    if (title) score += 15;
+    if (durSec > 10) score += 15;
+    return score;
+}
+
+function detectImageMime(buf) {
+    if (!buf || buf.length < 12) return "image/jpeg";
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return "image/webp";
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return "image/gif";
+    return "image/jpeg";
+}
+
+function httpOrHttpsGetBuffer(urlStr, timeoutMs = 4500) {
+    if (String(urlStr || "").startsWith("https://")) {
+        return httpsGetBuffer(urlStr, timeoutMs);
+    }
+    if (!String(urlStr || "").startsWith("http://")) {
+        return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+        const req = http.get(urlStr, { timeout: timeoutMs }, (res) => {
+            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume();
+                httpOrHttpsGetBuffer(res.headers.location, timeoutMs).then(resolve);
+                return;
+            }
+            if (res.statusCode && res.statusCode >= 400) {
+                res.resume();
+                resolve(null);
+                return;
+            }
+            const chunks = [];
+            let total = 0;
+            res.on("data", (c) => {
+                total += c.length;
+                if (total > 6 * 1024 * 1024) { req.destroy(); resolve(null); return; }
+                chunks.push(c);
+            });
+            res.on("end", () => {
+                const buf = Buffer.concat(chunks);
+                resolve(buf.length > 256 ? { buf, mime: detectImageMime(buf) } : null);
+            });
+        });
+        req.on("error", () => resolve(null));
+        req.on("timeout", () => { req.destroy(); resolve(null); });
+    });
+}
+
+function parseGVariantUnescape(s) {
+    return String(s || "")
+        .replace(/\\'/g, "'")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\");
+}
+
+function parseGdbusPlayerProps(raw) {
+    const text = String(raw || "");
+    const statusMatch = /'PlaybackStatus':\s*<'([^']*)'>/.exec(text);
+    const posMatch = /'Position':\s*<(?:int64\s+|uint64\s+)?(\d+)>/.exec(text);
+    const canSeekMatch = /'CanSeek':\s*<(true|false)>/.exec(text);
+    const canNextMatch = /'CanGoNext':\s*<(true|false)>/.exec(text);
+    const canPrevMatch = /'CanGoPrevious':\s*<(true|false)>/.exec(text);
+
+    const titleMatch = /'xesam:title':\s*<'((?:\\.|[^'\\])*)'>/.exec(text);
+    const albumMatch = /'xesam:album':\s*<'((?:\\.|[^'\\])*)'>/.exec(text);
+    const artMatch = /'mpris:artUrl':\s*<'((?:\\.|[^'\\])*)'>/.exec(text);
+    const trackIdMatch = /'mpris:trackid':\s*<(?:objectpath\s+)?'((?:\\.|[^'\\])*)'>/.exec(text);
+    const lenMatch = /'mpris:length':\s*<(?:int64\s+|uint64\s+)?(\d+)>/.exec(text);
+
+    let artist = "";
+    const artistArrMatch = /'xesam:artist':\s*<\[([^\]]*)\]>/.exec(text);
+    if (artistArrMatch) {
+        const names = [];
+        const itemRe = /'((?:\\.|[^'\\])*)'/g;
+        let m;
+        while ((m = itemRe.exec(artistArrMatch[1])) !== null) {
+            names.push(parseGVariantUnescape(m[1]));
+        }
+        artist = names.join(", ");
+    } else {
+        const artistStrMatch = /'xesam:artist':\s*<'((?:\\.|[^'\\])*)'>/.exec(text);
+        if (artistStrMatch) artist = parseGVariantUnescape(artistStrMatch[1]);
+    }
+
+    return {
+        status: statusMatch ? statusMatch[1] : "Stopped",
+        posSec: posMatch ? Number(posMatch[1]) / 1e6 : 0,
+        durSec: lenMatch ? Number(lenMatch[1]) / 1e6 : 0,
+        title: titleMatch ? parseGVariantUnescape(titleMatch[1]) : "",
+        artist,
+        album: albumMatch ? parseGVariantUnescape(albumMatch[1]) : "",
+        artUrl: artMatch ? parseGVariantUnescape(artMatch[1]) : "",
+        trackId: trackIdMatch ? parseGVariantUnescape(trackIdMatch[1]) : "",
+        canSeek: canSeekMatch ? canSeekMatch[1] === "true" : true,
+        canNext: canNextMatch ? canNextMatch[1] === "true" : true,
+        canPrev: canPrevMatch ? canPrevMatch[1] === "true" : true,
+    };
+}
+
+function matchesLinuxAudioApp(appHint, propText) {
+    if (!appHint || !propText) return false;
+    const h = String(appHint).toLowerCase().replace(/^org\.mpris\.mediaplayer2\./, "").split(".")[0];
+    const p = String(propText).toLowerCase();
+    const keys = [
+        "yandex", "spotify", "chrome", "chromium", "edge", "firefox", "opera",
+        "brave", "vivaldi", "vlc", "mpv", "rhythmbox", "audacious", "strawberry",
+        "elisa", "amberol", "tidal", "deezer", "telegram", "ayugram", "discord", "vesktop",
+    ];
+    for (const k of keys) {
+        if (h.includes(k) && p.includes(k)) return true;
+    }
+    return h.length >= 3 && p.includes(h);
+}
+
+class LinuxMediaDaemon {
+    constructor() {
+        this.lastStatus = { ts: 0, data: {} };
+        this._mprisBackend = null; // "playerctl" | "gdbus" | "none"
+        this._audioBackend = null; // "pactl" | "wpctl" | "amixer" | "none"
+        this._trackIdByPlayer = new Map();
+        this._artInFlight = new Set();
+    }
+
+    async _detectMprisBackend() {
+        if (this._mprisBackend !== null) return this._mprisBackend;
+        const p = await runCmdLinux("playerctl", ["--version"], 1200);
+        if (p.ok) { this._mprisBackend = "playerctl"; return "playerctl"; }
+        const g = await runCmdLinux("gdbus", ["--version"], 1200);
+        if (g.ok) { this._mprisBackend = "gdbus"; return "gdbus"; }
+        this._mprisBackend = "none";
+        return "none";
+    }
+
+    async _detectAudioBackend() {
+        if (this._audioBackend !== null) return this._audioBackend;
+        const pa = await runCmdLinux("pactl", ["--version"], 1200);
+        if (pa.ok) { this._audioBackend = "pactl"; return "pactl"; }
+        const wp = await runCmdLinux("wpctl", ["--version"], 1200);
+        if (wp.ok) { this._audioBackend = "wpctl"; return "wpctl"; }
+        const am = await runCmdLinux("amixer", ["--version"], 1200);
+        if (am.ok) { this._audioBackend = "amixer"; return "amixer"; }
+        this._audioBackend = "none";
+        return "none";
+    }
+
+    async _listPlayersViaPlayerctl() {
+        const res = await runCmdLinux("playerctl", ["-l"], 1500);
+        if (!res.ok || !res.stdout.trim()) return [];
+        const names = res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        const out = [];
+        const sep = "\x1f";
+        const fmt = [
+            "{{status}}",
+            "{{title}}",
+            "{{artist}}",
+            "{{album}}",
+            "{{position}}",
+            "{{mpris:length}}",
+            "{{mpris:artUrl}}",
+            "{{mpris:trackid}}",
+        ].join(sep);
+
+        await Promise.all(names.map(async (player) => {
+            const meta = await runCmdLinux("playerctl", ["-p", player, "metadata", "--format", fmt], 1500);
+            if (!meta.ok) return;
+            const parts = meta.stdout.replace(/\r?\n$/, "").split(sep);
+            const status = (parts[0] || "Stopped").trim();
+            const title = (parts[1] || "").trim();
+            const artist = (parts[2] || "").trim();
+            const album = (parts[3] || "").trim();
+            const posUs = Number(parts[4]) || 0;
+            const lenUs = Number(parts[5]) || 0;
+            const artUrl = (parts[6] || "").trim();
+            const trackId = (parts[7] || "").trim();
+            if (trackId) this._trackIdByPlayer.set(player, trackId);
+            out.push({
+                app: player,
+                status,
+                title,
+                artist,
+                album,
+                posSec: posUs / 1e6,
+                durSec: lenUs / 1e6,
+                artUrl,
+                trackId,
+                canSeek: lenUs > 0,
+                canNext: true,
+                canPrev: true,
+            });
+        }));
+        return out;
+    }
+
+    async _listPlayersViaGdbus() {
+        const listRes = await runCmdLinux("gdbus", [
+            "call", "--session",
+            "--dest", "org.freedesktop.DBus",
+            "--object-path", "/org/freedesktop/DBus",
+            "--method", "org.freedesktop.DBus.ListNames",
+        ], 1500);
+        if (!listRes.ok) return [];
+        const busNames = [];
+        const re = /'(org\.mpris\.MediaPlayer2\.[^']+)'/g;
+        let m;
+        while ((m = re.exec(listRes.stdout)) !== null) {
+            busNames.push(m[1]);
+        }
+        if (!busNames.length) return [];
+
+        const out = [];
+        await Promise.all(busNames.map(async (busName) => {
+            const propsRes = await runCmdLinux("gdbus", [
+                "call", "--session",
+                "--dest", busName,
+                "--object-path", "/org/mpris/MediaPlayer2",
+                "--method", "org.freedesktop.DBus.Properties.GetAll",
+                "org.mpris.MediaPlayer2.Player",
+            ], 1500);
+            if (!propsRes.ok) return;
+            const parsed = parseGdbusPlayerProps(propsRes.stdout);
+            if (parsed.trackId) this._trackIdByPlayer.set(busName, parsed.trackId);
+            out.push({ app: busName, ...parsed });
+        }));
+        return out;
+    }
+
+    async _getVolumeInfo(appHint) {
+        const backend = await this._detectAudioBackend();
+        if (backend === "pactl") {
+            if (appHint) {
+                const inputs = await runCmdLinux("pactl", ["list", "sink-inputs"], 1500);
+                if (inputs.ok && inputs.stdout) {
+                    const blocks = inputs.stdout.split(/Sink Input #/).slice(1);
+                    for (const b of blocks) {
+                        if (!matchesLinuxAudioApp(appHint, b)) continue;
+                        const volMatch = /Volume:[^\n]*?(\d+)%/.exec(b);
+                        const muteMatch = /Mute:\s*(yes|no)/i.exec(b);
+                        if (volMatch) {
+                            return {
+                                volume: Math.max(0, Math.min(100, parseInt(volMatch[1], 10))),
+                                muted: muteMatch ? muteMatch[1].toLowerCase() === "yes" : false,
+                                volumeScope: "app",
+                                volumeSupported: true,
+                            };
+                        }
+                    }
+                }
+            }
+            const [vRes, mRes] = await Promise.all([
+                runCmdLinux("pactl", ["get-sink-volume", "@DEFAULT_SINK@"], 1200),
+                runCmdLinux("pactl", ["get-sink-mute", "@DEFAULT_SINK@"], 1200),
+            ]);
+            const vMatch = /(\d+)%/.exec(vRes.stdout);
+            if (vRes.ok && vMatch) {
+                return {
+                    volume: Math.max(0, Math.min(100, parseInt(vMatch[1], 10))),
+                    muted: /yes/i.test(mRes.stdout),
+                    volumeScope: "master",
+                    volumeSupported: true,
+                };
+            }
+        } else if (backend === "wpctl") {
+            const res = await runCmdLinux("wpctl", ["get-volume", "@DEFAULT_AUDIO_SINK@"], 1200);
+            const m = /Volume:\s*([0-9.]+)/.exec(res.stdout);
+            if (res.ok && m) {
+                return {
+                    volume: Math.max(0, Math.min(100, Math.round(parseFloat(m[1]) * 100))),
+                    muted: /\[MUTED\]/i.test(res.stdout),
+                    volumeScope: "master",
+                    volumeSupported: true,
+                };
+            }
+        } else if (backend === "amixer") {
+            const res = await runCmdLinux("amixer", ["sget", "Master"], 1200);
+            const m = /\[(\d+)%\]/.exec(res.stdout);
+            if (res.ok && m) {
+                return {
+                    volume: Math.max(0, Math.min(100, parseInt(m[1], 10))),
+                    muted: /\[off\]/i.test(res.stdout),
+                    volumeScope: "master",
+                    volumeSupported: true,
+                };
+            }
+        }
+        return { volume: 100, muted: false, volumeScope: "master", volumeSupported: false };
+    }
+
+    async _setVolumeInfo(appHint, volPercent, muteMode) {
+        const backend = await this._detectAudioBackend();
+        if (backend === "pactl") {
+            if (appHint) {
+                const inputs = await runCmdLinux("pactl", ["list", "sink-inputs"], 1500);
+                if (inputs.ok && inputs.stdout) {
+                    const blocks = inputs.stdout.split(/Sink Input #/).slice(1);
+                    const matchedIds = [];
+                    for (const b of blocks) {
+                        const idMatch = /^(\d+)/.exec(b);
+                        if (idMatch && matchesLinuxAudioApp(appHint, b)) {
+                            matchedIds.push(idMatch[1]);
+                        }
+                    }
+                    if (matchedIds.length > 0) {
+                        for (const id of matchedIds) {
+                            if (volPercent >= 0) await runCmdLinux("pactl", ["set-sink-input-volume", id, `${volPercent}%`], 1200);
+                            if (muteMode >= 0) await runCmdLinux("pactl", ["set-sink-input-mute", id, muteMode ? "1" : "0"], 1200);
+                        }
+                        const info = await this._getVolumeInfo(appHint);
+                        return { ok: true, ...info };
+                    }
+                }
+            }
+            if (volPercent >= 0) await runCmdLinux("pactl", ["set-sink-volume", "@DEFAULT_SINK@", `${volPercent}%`], 1200);
+            if (muteMode >= 0) await runCmdLinux("pactl", ["set-sink-mute", "@DEFAULT_SINK@", muteMode ? "1" : "0"], 1200);
+            const info = await this._getVolumeInfo("");
+            return { ok: info.volumeSupported, ...info };
+        } else if (backend === "wpctl") {
+            if (volPercent >= 0) await runCmdLinux("wpctl", ["set-volume", "@DEFAULT_AUDIO_SINK@", (volPercent / 100).toFixed(2)], 1200);
+            if (muteMode >= 0) await runCmdLinux("wpctl", ["set-mute", "@DEFAULT_AUDIO_SINK@", muteMode ? "1" : "0"], 1200);
+            const info = await this._getVolumeInfo("");
+            return { ok: info.volumeSupported, ...info };
+        } else if (backend === "amixer") {
+            if (volPercent >= 0) await runCmdLinux("amixer", ["sset", "Master", `${volPercent}%`], 1200);
+            if (muteMode >= 0) await runCmdLinux("amixer", ["sset", "Master", muteMode ? "mute" : "unmute"], 1200);
+            const info = await this._getVolumeInfo("");
+            return { ok: info.volumeSupported, ...info };
+        }
+        return { ok: false, volume: 100, muted: false, volumeScope: "master" };
+    }
+
+    _loadArtUrlAsync(coverHash, artUrl) {
+        if (!artUrl || coverCache.has(coverHash) || this._artInFlight.has(coverHash)) return;
+        if (artUrl.startsWith("file://")) {
+            try {
+                const filePath = decodeURIComponent(artUrl.replace(/^file:\/\//, ""));
+                if (fs.existsSync(filePath)) {
+                    const buf = fs.readFileSync(filePath);
+                    if (buf && buf.length > 64 && buf.length < 6 * 1024 * 1024) {
+                        coverCache.set(coverHash, { buf, mime: detectImageMime(buf), hires: false });
+                        pruneCoverCache();
+                    }
+                }
+            } catch {}
+            return;
+        }
+        if (artUrl.startsWith("http://") || artUrl.startsWith("https://")) {
+            this._artInFlight.add(coverHash);
+            void httpOrHttpsGetBuffer(artUrl, 4000).then((img) => {
+                if (img && img.buf && !coverCache.has(coverHash)) {
+                    coverCache.set(coverHash, { buf: img.buf, mime: img.mime, hires: false });
+                    pruneCoverCache();
+                }
+            }).catch(() => {}).finally(() => {
+                this._artInFlight.delete(coverHash);
+            });
+        }
+    }
+
+    async getStatus(force = false) {
+        const now = Date.now();
+        if (!force && this.lastStatus.data && now - this.lastStatus.ts < 650) {
+            return this.lastStatus.data;
+        }
+        const backend = await this._detectMprisBackend();
+        if (backend === "none") {
+            const empty = { sessions: [] };
+            this.lastStatus = { ts: Date.now(), data: empty };
+            return empty;
+        }
+
+        const players = backend === "playerctl"
+            ? await this._listPlayersViaPlayerctl()
+            : await this._listPlayersViaGdbus();
+
+        let best = null;
+        let bestScore = -99999;
+        const sessionList = [];
+
+        for (const p of players) {
+            const isDeadMessenger = /ayugram|telegram|discord|vesktop|whatsapp|viber/i.test(p.app) && p.status !== "Playing" && p.durSec <= 0;
+            if (!p.title || isDeadMessenger) continue;
+            sessionList.push({
+                app: p.app,
+                appName: getLinuxAppDisplayName(p.app),
+                title: p.title,
+                artist: p.artist,
+                status: p.status,
+            });
+            const sc = scoreLinuxSession(p.app, p.title, p.status, p.durSec, pinnedAppId);
+            if (sc > bestScore) {
+                bestScore = sc;
+                best = p;
+            }
+        }
+
+        if (!best || bestScore < 0) {
+            const empty = { sessions: sessionList, pinnedApp: pinnedAppId || "", serverTimeMs: Date.now() };
+            this.lastStatus = { ts: Date.now(), data: empty };
+            return empty;
+        }
+
+        const coverHash = makeCoverHash(best.artist, best.title);
+        if (best.artUrl) {
+            this._loadArtUrlAsync(coverHash, best.artUrl);
+        }
+        const cached = coverCache.get(coverHash);
+        if (!cached || !cached.hires) {
+            void fetchHiResCoverAsync(coverHash, best.artist, best.title);
+        }
+        const finalEntry = coverCache.get(coverHash);
+        const volInfo = await this._getVolumeInfo(best.app);
+        const dur = Math.max(0, Number(best.durSec) || 0);
+        const pos = Math.max(0, dur > 0 ? Math.min(dur, Number(best.posSec) || 0) : (Number(best.posSec) || 0));
+
+        const d = {
+            title: best.title,
+            artist: best.artist,
+            album: best.album,
+            app: best.app,
+            appName: getLinuxAppDisplayName(best.app),
+            status: best.status,
+            pos: Math.round(pos * 100) / 100,
+            rawPos: Math.round(pos * 100) / 100,
+            start: 0,
+            dur: Math.round(dur * 100) / 100,
+            canSeek: Boolean(best.canSeek),
+            canNext: Boolean(best.canNext),
+            canPrev: Boolean(best.canPrev),
+            volume: volInfo.volume,
+            muted: volInfo.muted,
+            volumeScope: volInfo.volumeScope,
+            volumeSupported: volInfo.volumeSupported,
+            sessions: sessionList,
+            coverKey: finalEntry ? coverHash : "",
+            coverRev: finalEntry ? (finalEntry.hires ? "hr" : "lo") : "",
+            serverTimeMs: Date.now(),
+            pinnedApp: pinnedAppId || "",
+        };
+        this.lastStatus = { ts: Date.now(), data: d };
+        return d;
+    }
+
+    async control(cmd, extra = {}) {
+        const cur = this.lastStatus.data && this.lastStatus.data.title ? this.lastStatus.data : await this.getStatus(true);
+        const target = pinnedAppId || (cur && cur.app) || "";
+        if (!target) {
+            this.lastStatus.ts = 0;
+            return { ok: false, error: "no_media_session" };
+        }
+        const backend = await this._detectMprisBackend();
+        let res = { ok: false };
+
+        if (backend === "playerctl") {
+            if (cmd === "playpause") res = await runCmdLinux("playerctl", ["-p", target, "play-pause"], 1500);
+            else if (cmd === "next") res = await runCmdLinux("playerctl", ["-p", target, "next"], 1500);
+            else if (cmd === "prev") res = await runCmdLinux("playerctl", ["-p", target, "previous"], 1500);
+            else if (cmd === "seek") {
+                const sec = Math.max(0, Number(extra.sec) || 0);
+                res = await runCmdLinux("playerctl", ["-p", target, "position", String(sec)], 1500);
+            }
+        } else if (backend === "gdbus") {
+            const busName = target.startsWith("org.mpris.MediaPlayer2.") ? target : `org.mpris.MediaPlayer2.${target}`;
+            const methodMap = { playpause: "PlayPause", next: "Next", prev: "Previous" };
+            if (methodMap[cmd]) {
+                res = await runCmdLinux("gdbus", [
+                    "call", "--session", "--dest", busName,
+                    "--object-path", "/org/mpris/MediaPlayer2",
+                    "--method", `org.mpris.MediaPlayer2.Player.${methodMap[cmd]}`,
+                ], 1500);
+            } else if (cmd === "seek") {
+                const trackId = this._trackIdByPlayer.get(busName) || "/org/mpris/MediaPlayer2/TrackList/NoTrack";
+                const sec = Math.max(0, Number(extra.sec) || 0);
+                const usec = Math.round(sec * 1e6);
+                res = await runCmdLinux("gdbus", [
+                    "call", "--session", "--dest", busName,
+                    "--object-path", "/org/mpris/MediaPlayer2",
+                    "--method", "org.mpris.MediaPlayer2.Player.SetPosition",
+                    trackId, String(usec),
+                ], 1500);
+            }
+        }
+
+        this.lastStatus.ts = 0;
+        if (cmd === "seek") {
+            return { ok: true, sought: Boolean(res.ok), sec: Math.max(0, Number(extra.sec) || 0) };
+        }
+        return { ok: Boolean(res.ok), error: res.ok ? null : "control_unsupported" };
+    }
+
+    async setVolume(opts = {}) {
+        const appHint = pinnedAppId || (this.lastStatus.data && this.lastStatus.data.app) || "";
+        const vArg = opts.volume !== undefined && Number.isFinite(Number(opts.volume))
+            ? Math.max(0, Math.min(100, Math.round(Number(opts.volume))))
+            : -1;
+        const mArg = typeof opts.muted === "boolean" ? (opts.muted ? 1 : 0) : -1;
+        const resp = await this._setVolumeInfo(appHint, vArg, mArg);
+        if (resp && resp.ok && this.lastStatus.data) {
+            this.lastStatus.data.volume = resp.volume;
+            this.lastStatus.data.muted = resp.muted;
+            this.lastStatus.data.volumeScope = resp.volumeScope;
+        }
+        return resp;
+    }
+
+    selectSession(appId) {
+        pinnedAppId = String(appId || "");
+        this.lastStatus.ts = 0;
+        return { ok: true, pinnedApp: pinnedAppId };
+    }
+
+    dispose() {}
+}
+
+class NoopMediaDaemon {
+    async getStatus() { return { sessions: [] }; }
+    async control() { return { ok: false, error: "unsupported_platform" }; }
+    async setVolume() { return { ok: false, error: "unsupported_platform" }; }
+    selectSession(appId) { pinnedAppId = String(appId || ""); return { ok: true, pinnedApp: pinnedAppId }; }
+    dispose() {}
+}
+
+const daemon = process.platform === "win32"
+    ? new MediaDaemon()
+    : (process.platform === "linux" ? new LinuxMediaDaemon() : new NoopMediaDaemon());
 if (appRef && typeof appRef.on === "function") {
     appRef.on("before-quit", () => daemon.dispose());
 }
@@ -1036,4 +1618,10 @@ module.exports = {
     mediaDaemon: daemon,
     fetchLyrics,
     getCoverByHash,
+    _test: {
+        parseGdbusPlayerProps,
+        getLinuxAppDisplayName,
+        matchesLinuxAudioApp,
+        scoreLinuxSession,
+    },
 };

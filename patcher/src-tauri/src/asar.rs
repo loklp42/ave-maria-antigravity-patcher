@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -111,6 +111,12 @@ impl AsarArchive {
         Ok(out)
     }
 
+    pub fn read_unpacked_dirs(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        collect_unpacked_dirs(&self.header, "", &mut out);
+        out
+    }
+
     fn traverse_node(
         &self,
         node: &Value,
@@ -177,6 +183,25 @@ impl AsarArchive {
     }
 }
 
+fn collect_unpacked_dirs(node: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+    let Some(files) = node.get("files").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (name, item) in files {
+        if item.get("files").is_some() {
+            let full_path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if item.get("unpacked").and_then(|v| v.as_bool()).unwrap_or(false) {
+                out.insert(full_path.clone());
+            }
+            collect_unpacked_dirs(item, &full_path, out);
+        }
+    }
+}
+
 fn parse_offset(val: Option<&Value>) -> Result<u64, String> {
     match val {
         Some(Value::String(s)) => s
@@ -228,9 +253,18 @@ pub fn sha256_file<P: AsRef<Path>>(path: P) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[allow(dead_code)]
 pub fn write_asar<P: AsRef<Path>>(
     output_path: P,
     entries: &BTreeMap<String, AsarEntry>,
+) -> Result<(), String> {
+    write_asar_with_unpacked_dirs(output_path, entries, &BTreeSet::new())
+}
+
+pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
+    output_path: P,
+    entries: &BTreeMap<String, AsarEntry>,
+    unpacked_dirs: &BTreeSet<String>,
 ) -> Result<(), String> {
     let mut root = Map::new();
     root.insert("files".into(), Value::Object(Map::new()));
@@ -247,7 +281,13 @@ pub fn write_asar<P: AsRef<Path>>(
         let dirs = &parts[..parts.len() - 1];
 
         let mut curr = &mut root;
+        let mut dir_prefix = String::new();
         for dir in dirs {
+            if !dir_prefix.is_empty() {
+                dir_prefix.push('/');
+            }
+            dir_prefix.push_str(dir);
+            let is_unpacked_dir = unpacked_dirs.contains(&dir_prefix);
             let files_map = curr
                 .entry("files")
                 .or_insert_with(|| Value::Object(Map::new()))
@@ -261,6 +301,9 @@ pub fn write_asar<P: AsRef<Path>>(
             curr = next
                 .as_object_mut()
                 .ok_or("Некорректная директория в дереве ASAR")?;
+            if is_unpacked_dir {
+                curr.insert("unpacked".into(), Value::Bool(true));
+            }
         }
 
         let files_map = curr
@@ -345,6 +388,12 @@ pub fn write_asar<P: AsRef<Path>>(
     fs::rename(&tmp_path, out_path)
         .map_err(|e| format!("Ошибка переименования временного ASAR: {e}"))?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(out_path, fs::Permissions::from_mode(0o644));
+    }
+
     Ok(())
 }
 
@@ -392,6 +441,40 @@ mod tests {
         assert!(matches!(
             all.get("node_modules/native/addon.node"),
             Some(AsarEntry::Unpacked { size: 4096, executable: true, .. })
+        ));
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn asar_roundtrip_preserves_unpacked_dirs_and_symlinks() {
+        let tmp = std::env::temp_dir().join("agy_test_unpacked_dirs.asar");
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "node_modules/chrome-devtools-mcp/bin/cli.js".to_string(),
+            AsarEntry::Unpacked {
+                size: 128,
+                executable: true,
+                integrity: None,
+            },
+        );
+        entries.insert(
+            "bin/link".to_string(),
+            AsarEntry::Symlink {
+                link: "../target".to_string(),
+            },
+        );
+        let mut unpacked_dirs = BTreeSet::new();
+        unpacked_dirs.insert("node_modules/chrome-devtools-mcp".to_string());
+
+        write_asar_with_unpacked_dirs(&tmp, &entries, &unpacked_dirs)
+            .expect("write_asar_with_unpacked_dirs failed");
+        let archive = AsarArchive::open(&tmp).expect("open failed");
+        let read_dirs = archive.read_unpacked_dirs();
+        assert!(read_dirs.contains("node_modules/chrome-devtools-mcp"));
+        let all = archive.read_all_entries().unwrap();
+        assert!(matches!(
+            all.get("bin/link"),
+            Some(AsarEntry::Symlink { link }) if link == "../target"
         ));
         let _ = fs::remove_file(&tmp);
     }

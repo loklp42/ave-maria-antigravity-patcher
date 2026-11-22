@@ -15,7 +15,13 @@ function getAppDataRoot() {
     if (electronApp && typeof electronApp.getPath === "function") {
         try { return electronApp.getPath("appData"); } catch {}
     }
-    return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    if (process.platform === "win32") {
+        return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    }
+    if (process.platform === "darwin") {
+        return path.join(os.homedir(), "Library", "Application Support");
+    }
+    return process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 }
 
 function getSharedAppDir() {

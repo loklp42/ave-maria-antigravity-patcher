@@ -1,5 +1,6 @@
 "use strict";
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const http = require("http");
 const { handleExtrasRequest, buildExtrasClientJs } = require("./agyExtras");
@@ -47,8 +48,8 @@ const BASE_THEME = {
     label: "Antigravity",
     accentRgb: "96, 165, 250",
     tintRgb: "12, 14, 20",
-    uiFont: "'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif",
-    monoFont: "'Cascadia Code', Consolas, monospace",
+    uiFont: "'Segoe UI Variable', 'Segoe UI', 'Ubuntu', 'Cantarell', 'Noto Sans', system-ui, sans-serif",
+    monoFont: "'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, 'DejaVu Sans Mono', monospace",
     fontSize: "14px",
 };
 
@@ -98,6 +99,42 @@ function getAppearanceConfigPath() {
     return path.join(dir, "agy_appearance.json");
 }
 
+function findLinuxSteamWorkshopDir() {
+    const home = os.homedir();
+    const steamRoots = [
+        path.join(home, ".local", "share", "Steam"),
+        path.join(home, ".steam", "steam"),
+        path.join(home, ".steam", "root"),
+        path.join(home, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
+        path.join(home, ".var", "app", "com.valvesoftware.Steam", ".steam", "steam"),
+        path.join(home, "snap", "steam", "common", ".local", "share", "Steam"),
+    ];
+    const libraries = [];
+    for (const root of steamRoots) {
+        if (!fs.existsSync(root)) continue;
+        if (!libraries.includes(root)) libraries.push(root);
+        try {
+            const vdfPath = path.join(root, "steamapps", "libraryfolders.vdf");
+            if (fs.existsSync(vdfPath)) {
+                const content = fs.readFileSync(vdfPath, "utf8");
+                const re = /"path"\s+"([^"]+)"/gi;
+                let m;
+                while ((m = re.exec(content)) !== null) {
+                    const lib = m[1].replace(/\\\\/g, "/");
+                    if (lib && fs.existsSync(lib) && !libraries.includes(lib)) {
+                        libraries.push(lib);
+                    }
+                }
+            }
+        } catch {}
+    }
+    for (const lib of libraries) {
+        const ws = path.join(lib, "steamapps", "workshop", "content", "431960");
+        if (fs.existsSync(ws)) return ws;
+    }
+    return "";
+}
+
 function getWallpaperDir() {
     try {
         const sharedDir = pathsMod && typeof pathsMod.getSharedConfigDir === "function"
@@ -111,6 +148,13 @@ function getWallpaperDir() {
             }
         }
     } catch {}
+    if (DEFAULT_WALLPAPER_DIR && fs.existsSync(DEFAULT_WALLPAPER_DIR)) {
+        return DEFAULT_WALLPAPER_DIR;
+    }
+    if (process.platform === "linux") {
+        const linuxWs = findLinuxSteamWorkshopDir();
+        if (linuxWs) return linuxWs;
+    }
     return DEFAULT_WALLPAPER_DIR;
 }
 

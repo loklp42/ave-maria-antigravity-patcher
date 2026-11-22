@@ -3,6 +3,7 @@ target/
 dist/
 build/
 *.exe
+/AntigravityPatcher
 *.dll
 *.node
 *.lib
@@ -34,3 +35,6 @@ Desktop.ini
 *.log
 npm-debug.log*
 yarn-debug.log*
+
+# Local roadmap & personal planning
+ROADMAP.md

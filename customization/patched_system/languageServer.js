@@ -302,7 +302,7 @@ function setupNodeModules(env, modules) {
 // SIGTERM killed the app without running before-quit (so the language server
 // was not shut down).
 const shellEnvReads = new loginShellEnvReads_1.LoginShellEnvReads(false);
-let _cachedWinShellEnv = null;
+let _cachedShellEnv = null;
 /**
  * Starts loading the login-shell env (spawns an interactive shell, which can
  * take seconds with heavy rc files) so it overlaps app startup instead of
@@ -330,11 +330,11 @@ async function startLanguageServer(port, csrf, options = {}) {
         ? (explicitGeminiDir || (useWinIsolation ? winIsolation.getIsolatedGeminiDir(profileArg) : (0, paths_1.getGeminiDirForProfile)(profileArg)))
         : '';
     const isForActive = profileKey === getActiveProfileKey();
-    const loginShellEnv = (isWindows && _cachedWinShellEnv !== null)
-        ? _cachedWinShellEnv
+    const loginShellEnv = _cachedShellEnv !== null
+        ? _cachedShellEnv
         : await shellEnvReads.take();
-    if (isWindows && _cachedWinShellEnv === null) {
-        _cachedWinShellEnv = loginShellEnv;
+    if (_cachedShellEnv === null) {
+        _cachedShellEnv = loginShellEnv;
     }
     if (_intentionalTermination) {
         throw new Error('Language server startup aborted during shutdown');
@@ -383,6 +383,20 @@ async function startLanguageServer(port, csrf, options = {}) {
         const env = { ...process.env, ...loginShellEnv };
         env['ANTIGRAVITY_SERVER_CSRF_TOKEN'] = csrf;
         env['AGY_REQUIRE_AUTHENTICATED_UI_BOOTSTRAP'] = '1';
+        if (!isWindows && profileArg && resolvedGeminiDir) {
+            const xdgBase = path_1.default.join(resolvedGeminiDir, '.xdg');
+            const xdgConfig = path_1.default.join(xdgBase, 'config');
+            const xdgData = path_1.default.join(xdgBase, 'data');
+            const xdgCache = path_1.default.join(xdgBase, 'cache');
+            const xdgState = path_1.default.join(xdgBase, 'state');
+            for (const dir of [xdgConfig, xdgData, xdgCache, xdgState]) {
+                try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+            }
+            env['XDG_CONFIG_HOME'] = xdgConfig;
+            env['XDG_DATA_HOME'] = xdgData;
+            env['XDG_CACHE_HOME'] = xdgCache;
+            env['XDG_STATE_HOME'] = xdgState;
+        }
         if (wsl && !useWinIsolation) {
             (0, authBootstrap_1.appendWslAuthEnvForwarding)(env);
         }
