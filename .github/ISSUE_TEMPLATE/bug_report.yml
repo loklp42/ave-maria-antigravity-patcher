@@ -1,0 +1,53 @@
+name: "🐛 Bug report / Сообщить о баге"
+description: "Сообщить об ошибке в патчере или кастомизации Antigravity"
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Где возникла проблема?"
+      options:
+        - "Патчер (AntigravityPatcher.exe)"
+        - "Живые / фото-обои"
+        - "Плеер"
+        - "Русификация (RU / EN)"
+        - "Мультиаккаунты / Вкладки"
+        - "Интерфейс / Настройки персонализации"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: "Версия патчера и Antigravity"
+      value: "v2.34.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Описание бага"
+      description: "Кратко опишите, что пошло не так и что вы ожидали увидеть."
+      placeholder: "Например: при нажатии на..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Шаги для воспроизведения"
+      placeholder: |
+        1. Открыть...
+        2. Нажать...
+        3. Происходит...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Скриншоты или журнал ошибок"
+      description: "Перетащите скриншот или вставьте текст из вкладки «Журнал» в патчере."
+      placeholder: "Необязательно"
