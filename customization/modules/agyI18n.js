@@ -6,6 +6,7 @@ function agyI18nBootstrap() {
     function formatDurationRu(raw) {
         if (!raw) return "";
         return String(raw)
+            .replace(/\bjust\s+now\b/gi, "только что")
             .replace(/<\s*1\s*m\b/gi, "<1 мин")
             .replace(/(\d+)\s*mo\b/gi, "$1 мес")
             .replace(/(\d+)\s*months?\b/gi, "$1 мес")
@@ -21,7 +22,59 @@ function agyI18nBootstrap() {
             .replace(/(\d+)\s*m\b/gi, "$1 мин")
             .replace(/(\d+)\s*seconds?\b/gi, "$1 сек")
             .replace(/(\d+)\s*secs?\b/gi, "$1 сек")
-            .replace(/(\d+)\s*s\b/gi, "$1 сек");
+            .replace(/(\d+)\s*s\b/gi, "$1 сек")
+            .replace(/\bago\b/gi, "назад");
+    }
+
+    function formatMonthRu(raw) {
+        if (!raw) return "";
+        const months = {
+            jan: "января", january: "января",
+            feb: "февраля", february: "февраля",
+            mar: "марта", march: "марта",
+            apr: "апреля", april: "апреля",
+            may: "мая",
+            jun: "июня", june: "июня",
+            jul: "июля", july: "июля",
+            aug: "августа", august: "августа",
+            sep: "сентября", september: "сентября",
+            oct: "октября", october: "октября",
+            nov: "ноября", november: "ноября",
+            dec: "декабря", december: "декабря"
+        };
+        return months[String(raw).toLowerCase()] || raw;
+    }
+
+    function formatPlanListRu(plans, genitive = true) {
+        if (!plans) return "";
+        let s = String(plans).trim();
+        if (genitive) {
+            return s
+                .replace(/\bultra\s+and\s+paid\s+pro\b/gi, "Ultra и платного Pro")
+                .replace(/\bpaid\s+pro\s+and\s+ultra\b/gi, "платного Pro и Ultra")
+                .replace(/\bpaid\s+pro\b/gi, "платного Pro")
+                .replace(/\bpro\b/gi, "Pro")
+                .replace(/\bultra\b/gi, "Ultra")
+                .replace(/\band\b/gi, "и")
+                .replace(/\bor\b/gi, "или");
+        }
+        return s
+            .replace(/\bultra\s+and\s+paid\s+pro\b/gi, "Ultra и Pro")
+            .replace(/\bpaid\s+pro\s+and\s+ultra\b/gi, "Pro и Ultra")
+            .replace(/\bpaid\s+pro\b/gi, "Pro")
+            .replace(/\bpro\b/gi, "Pro")
+            .replace(/\bultra\b/gi, "Ultra")
+            .replace(/\band\b/gi, "и")
+            .replace(/\bor\b/gi, "или");
+    }
+
+    function formatFullDateRu(raw) {
+        if (!raw) return "";
+        return String(raw).replace(/([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/gi, (match, month, day, year) => {
+            const ruMonth = formatMonthRu(month);
+            if (!ruMonth || ruMonth.toLowerCase() === month.toLowerCase()) return match;
+            return day + " " + ruMonth + (year ? " " + year + " г." : "");
+        });
     }
 
     const EXACT_RU = {
@@ -207,7 +260,6 @@ function agyI18nBootstrap() {
         "Privacy Notice": "Уведомление о конфиденциальности",
         "(excluding product analytics data)": "(кроме данных продуктовой аналитики)",
         "Google Privacy Policy": "Политике конфиденциальности Google",
-        "and": "и",
         ". You can control this from your settings at any point.": ". Вы можете изменить это в настройках в любой момент.",
         "You can control this from your settings at any point.": "Вы можете изменить это в настройках в любой момент.",
         "Sign up for newsletters, tips and tricks, and other notifications about": "Подписаться на рассылку, советы и уведомления о",
@@ -240,7 +292,8 @@ function agyI18nBootstrap() {
         "Select model": "Выбрать модель",
         "Switch model": "Сменить модель",
         "Change model": "Сменить модель",
-        "Best of N Models": "Модели (Лучший из N)",
+        "Applies to /btw and messages sent after this turn": "Применяется к /btw и сообщениям, отправленным после этого шага",
+        "Best of N Models": "Модели Best-of-N",
         "Orchestrator": "Оркестратор",
         "The Orchestrator's own planner": "Собственный планировщик оркестратора",
         "Thinking effort": "Глубина размышлений",
@@ -250,6 +303,26 @@ function agyI18nBootstrap() {
         "Offloads routine steps to a faster executor. Same quality, fewer tokens used.": "Передаёт рутинные шаги быстрому исполнителю. То же качество, меньше токенов.",
         "For most deep reasoning and complex problems": "Для глубокого анализа и сложных задач",
         "The original Gemini 4 model for advanced workflows": "Оригинальная модель Gemini 4 для сложных рабочих процессов",
+        "The original Gemini 4 model for advanced workflows. Leaving on Nov 30.": "Оригинальная модель Gemini 4 для сложных рабочих процессов. Будет отключена 30 ноября.",
+        "The original Gemini 4 model for advanced workflows. Leaving on Nov 30": "Оригинальная модель Gemini 4 для сложных рабочих процессов. Будет отключена 30 ноября",
+        "Leaving on Nov 30.": "Будет отключена 30 ноября.",
+        "Leaving on Nov 30": "Будет отключена 30 ноября",
+        "Leaving Soon": "Скоро устареет",
+        "Leaving soon": "Скоро устареет",
+        "Use Hydrogen for better quality with lower quota usage. Leaving on Nov 30.": "Используйте Hydrogen для лучшего качества при меньшем расходе квоты. Будет отключена 30 ноября.",
+        "Use Hydrogen for better quality with lower quota usage. Leaving on Nov 30": "Используйте Hydrogen для лучшего качества при меньшем расходе квоты. Будет отключена 30 ноября",
+        "Use Hydrogen for better quality with lower quota usage.": "Используйте Hydrogen для лучшего качества при меньшем расходе квоты.",
+        "Use Hydrogen for better quality with lower quota usage": "Используйте Hydrogen для лучшего качества при меньшем расходе квоты",
+        "Gemini 4 Hydrogen is currently available to paid Pro and Ultra subscribers.": "Gemini 4 Hydrogen сейчас доступна подписчикам тарифов платного Pro и Ultra.",
+        "Gemini 4 Neon is currently available to paid Pro and Ultra subscribers.": "Gemini 4 Neon сейчас доступна подписчикам тарифов платного Pro и Ultra.",
+        "Gemini 4 Argon is currently available to Ultra and paid Pro subscribers.": "Gemini 4 Argon сейчас доступна подписчикам тарифов Ultra и платного Pro.",
+        "Gemini 4 Carbon is currently available to Ultra and paid Pro subscribers.": "Gemini 4 Carbon сейчас доступна подписчикам тарифов Ultra и платного Pro.",
+        "Gemini 4 Argon is currently available to Ultra and paid Pro plan subscribers.": "Gemini 4 Argon сейчас доступна подписчикам тарифов Ultra и платного Pro.",
+        "Gemini 4 Carbon is currently available to Ultra and paid Pro plan subscribers.": "Gemini 4 Carbon сейчас доступна подписчикам тарифов Ultra и платного Pro.",
+        "Gemini 4 Hydrogen is currently available to paid Pro and Ultra plan subscribers.": "Gemini 4 Hydrogen сейчас доступна подписчикам тарифов платного Pro и Ultra.",
+        "Gemini 4 Neon is currently available to paid Pro and Ultra plan subscribers.": "Gemini 4 Neon сейчас доступна подписчикам тарифов платного Pro и Ultra.",
+        "Opus 5.5 is now available on paid Pro and Ultra plans. Third-party model access will no longer be available on your current plan starting on November 30, 2026.": "Opus 5.5 доступна на платных тарифах Pro и Ultra. Доступ к сторонним моделям на вашем текущем тарифе прекратится с 30 ноября 2026 г.",
+        "Sonnet 5.5 is now available on paid Pro and Ultra plans. Third-party model access will no longer be available on your current plan starting on November 30, 2026.": "Sonnet 5.5 доступна на платных тарифах Pro и Ultra. Доступ к сторонним моделям на вашем текущем тарифе прекратится с 30 ноября 2026 г.",
         "For speed and efficiency in execution tasks": "Для высокой скорости и эффективности выполнения задач",
         "Add Model": "Добавить модель",
         "Edit Model": "Изменить модель",
@@ -316,7 +389,9 @@ function agyI18nBootstrap() {
         "Carries out the plan: searches, edits, builds, and tests. Pick a faster, cheaper model.": "Выполняет план: поиск, правки, сборка и тесты. Выберите более быструю и экономичную модель.",
         "Gemini Models": "Модели Gemini",
         "Claude and GPT models": "Модели Claude и GPT",
-        "Claude & GPT": "Claude и GPT",
+        "Claude & GPT": "Модели Claude и GPT",
+        "Gemini & Argon": "Модели Gemini и Argon",
+        "Gemini & Argon Models": "Модели Gemini и Argon",
         "Weekly Limit Remaining": "Недельный лимит",
         "Five Hour Limit Remaining": "5-часовой лимит",
         "Gemini 4 Argon Weekly Limit": "Недельный лимит Gemini 4 Argon",
@@ -519,14 +594,12 @@ function agyI18nBootstrap() {
         "Open Workspace Selector": "Выбор рабочей области",
         "File Picker": "Выбор файла",
         "Code Search": "Поиск по коду",
-        "Open in Code Search": "Открыть в Code Search",
-        "Open in Cider": "Открыть в Cider",
+        "Open in Code Search": "Поиск по коду (Code Search)",
         "Terminal: Add to Chat": "Терминал: добавить в чат",
         "Terminal: Select All": "Терминал: выделить всё",
         "Submit Prompt (Alternate to Enter)": "Отправить запрос (альтернатива Enter)",
         "Enter always submits. This adds a second shortcut.": "Enter всегда отправляет. Это добавляет второе сочетание.",
         "Open Trajectory Debug View": "Отладка траектории",
-        "Refresh gcert Credentials": "Обновить учётные данные gcert",
         "This shortcut is reserved by browser tabs and may not trigger in Web mode. It works in the Desktop Hub or installed PWA.": "Это сочетание зарезервировано вкладками браузера в веб-режиме, но работает в десктопном приложении.",
 
         // Settings — Notifications
@@ -659,7 +732,6 @@ function agyI18nBootstrap() {
 
         // Customizations, MCP, Plugins, Hooks, Developer
         "Default Customizations": "Стандартная кастомизация",
-        "Include Jetski Default Customizations": "Стандартные кастомизации",
         "Include default customizations, such as default skills.": "Включить стандартные кастомизации и навыки.",
         "When enabled, the agent will include default customizations, including default skills.": "Если включено, агент использует стандартные кастомизации и навыки.",
         "Customize Global Skills": "Настроить глобальные навыки",
@@ -713,7 +785,7 @@ function agyI18nBootstrap() {
         "Experimental": "Экспериментальные",
         "Labs": "Эксперименты",
         "Advanced": "Дополнительно",
-        "Best of N": "Лучший из N",
+        "Best of N": "Best-of-N",
         "Environments": "Окружения",
 
         // Conversation Actions & General UI Buttons
@@ -726,7 +798,7 @@ function agyI18nBootstrap() {
         "Background tasks and terminals agents left running, across all conversations.": "Фоновые задачи и терминалы во всех диалогах.",
         "Artifacts": "Артефакты",
         "Changes": "Изменения",
-        "Diff": "Отличия",
+        "Diff": "Дифф",
         "Overview": "Обзор",
         "Swarm": "Рой агентов",
         "What would you like to work on?": "Над чем поработаем?",
@@ -793,14 +865,14 @@ function agyI18nBootstrap() {
         "Conversation Name": "Название диалога",
         "Conversation ID": "ID диалога",
         "Workspace Name": "Имя рабочей области",
-        "Worktree Name": "Имя ветки",
+        "Worktree Name": "Имя Worktree",
         "Project Name": "Название проекта",
         "Split": "Разделить",
         "Split Right": "Разделить вправо",
         "Split Down": "Разделить вниз",
         "Replace with New": "Заменить новым",
         "Remove from Split": "Убрать из разделения",
-        "Fork": "Создать копию",
+        "Fork": "Форк",
         "Restore": "Восстановить",
         "Delete Permanently": "Удалить навсегда",
         "View Debug": "Отладка",
@@ -969,7 +1041,6 @@ function agyI18nBootstrap() {
         "High": "Высокий",
         "Max": "Макс",
         "Minimal": "Минимум",
-        "None": "Нет",
         "Off": "Выкл",
         "On": "Вкл",
         "Enabled": "Включено",
@@ -1024,7 +1095,24 @@ function agyI18nBootstrap() {
         "Add inline comment": "Добавить комментарий",
         "Review": "Проверка",
         "For Turn": "За ход",
-        "Open Diff": "Открыть отличия",
+        "Open Diff": "Открыть дифф",
+        "View Split Diff": "Раздельный дифф",
+        "View Unified Diff": "Единый дифф",
+        "View Inline Diff": "Встроенный дифф",
+        "Split Diff": "Раздельный дифф",
+        "Unified Diff": "Единый дифф",
+        "Hide Whitespace Changes": "Скрыть изменения пробелов",
+        "Show Whitespace Changes": "Показать изменения пробелов",
+        "Collapse All": "Свернуть все",
+        "Expand All": "Развернуть все",
+        "No Results": "Нет результатов",
+        "No results": "Нет результатов",
+        "Match Whole Word": "Слово целиком",
+        "Match Case": "Учитывать регистр",
+        "Use Regular Expression": "Регулярное выражение",
+        "Previous Match": "Предыдущее совпадение",
+        "Next Match": "Следующее совпадение",
+        "Not included with your current plan.": "Не входит в ваш текущий тариф.",
         "Create": "Создать",
         "Add": "Добавить",
         "Apply": "Применить",
@@ -1146,8 +1234,6 @@ function agyI18nBootstrap() {
         "Steps to Reproduce": "Шаги воспроизведения",
         "Attach a screenshot (optional)": "Прикрепить скриншот (необязательно)",
         "Attach Antigravity server logs": "Прикрепить логи сервера Antigravity",
-        "Windows Subsystem for Linux": "Подсистема Windows для Linux (WSL)",
-        "Local Windows environment": "Локальная среда Windows",
         "Download Diagnostics": "Скачать диагностику",
         "Diagnostics": "Диагностика",
         "Logs": "Журналы",
@@ -1216,13 +1302,11 @@ function agyI18nBootstrap() {
         "Owner": "Владелец",
         "Author": "Автор",
         "Branch": "Ветка",
-        "From": "От",
         "Sent": "Отправлено",
         "Agent": "Агент",
         "Seek": "Перемотка",
-        "Standalone": "Автономно",
+        "Standalone": "Автономный",
         "Link Settings": "Настройки ссылок",
-        "tokens)": "токенов)",
         "Listening. Ask anything.": "Слушаю. Спросите что угодно.",
         "Voice speed": "Скорость голоса",
         "Mute mic": "Выключить микрофон",
@@ -1250,13 +1334,11 @@ function agyI18nBootstrap() {
         "Global": "Глобальный",
         "Also includes": "Также включает",
         "when working in this project.": "при работе в этом проекте.",
-        "Visit": "Посетите раздел",
         "to ask for content changes for legal reasons.": "чтобы запросить изменение контента по юридическим причинам.",
         "(single edit)": "(одна правка)",
         "Viewing Diff": "Просмотр изменений",
         "Side Question": "Побочный вопрос",
         "Controls permissions for remote conversations.": "Управление разрешениями для удалённых диалогов.",
-        "lines": "строк",
         "Confirm Undo": "Подтвердить отмену",
         "This undo action will not make any code changes.": "Эта отмена не изменит код.",
         "Confirming this undo action will make the following changes:": "Подтверждение отмены внесёт следующие изменения:",
@@ -1289,6 +1371,152 @@ function agyI18nBootstrap() {
         "More Plugins": "Другие плагины",
         "Explore other marketplace customizations": "Другие расширения из маркетплейса",
         "Google does not control the availability or functionality of third party developer tools. Your data from third party developer tools connected to your Antigravity instance may be shared with Google. Google will protect any such data in accordance with the Google Privacy Policy, found here:": "Google не контролирует доступность и работу сторонних инструментов разработчиков. Данные из подключённых сторонних инструментов могут передаваться в Google и защищаются в соответствии с Политикой конфиденциальности Google:",
+        // Search & Input Prompts
+        "What should it do?": "Что нужно сделать?",
+        "Optional branch or ref used when creating a new Cog workspace (defaults to main if unset).": "Необязательная ветка или ref для нового Cog-воркспейса (по умолчанию main).",
+
+        // Window, Tabs & Navigation
+        "Zoom out (-)": "Уменьшить (-)",
+        "Zoom in (+)": "Увеличить (+)",
+        "Open Image in New Tab": "Открыть изображение в новой вкладке",
+        "Close Tabs to the Left": "Закрыть вкладки слева",
+        "Close Tabs to the Right": "Закрыть вкладки справа",
+        "Zoom": "Масштаб",
+        "Reset zoom (0)": "Сбросить масштаб (0)",
+
+        // Git & VCS Panel
+        "Sample GDoc": "Пример Google Документа",
+        "Copy Image Address": "Копировать адрес изображения",
+        "Default Cog repository": "Cog-репозиторий по умолчанию",
+        "Default Cog branch / ref": "Ветка/ref Cog по умолчанию",
+        "Use full VCS clones for Best of N": "Использовать полные клоны VCS для Best-of-N",
+        "Use full Git clones for Best of N": "Использовать полные Git-клоны для Best-of-N",
+        "Output": "Вывод",
+        "Errors": "Ошибки",
+        "Fork in Shared Workspace": "Форк в общей рабочей области",
+        "Fork in New Workspace": "Форк в новой рабочей области",
+        "Repository": "Репозиторий",
+        "New Group": "Новая группа",
+        "Text Selection": "Выделенный текст",
+        "Connect GitHub": "Подключить GitHub",
+        "Pull Requests": "Пулл-реквесты",
+        "Include unstaged changes": "Включить неиндексированные изменения",
+        "Commit": "Коммит",
+        "Amend": "Дополнить коммит (Amend)",
+        "Push": "Отправить (Push)",
+        "Uncommitted": "Не закоммичено",
+        "Connected Google Drive and GitHub resources": "Подключённые ресурсы Google Диска и GitHub",
+        "Amend succeeded": "Коммит успешно дополнен",
+        "Added (Staged)": "Добавлено (индексировано)",
+        "Untracked (Unstaged)": "Неотслеживаемое (неиндексировано)",
+        "Recent Files": "Недавние файлы",
+        "Coordinators": "Координаторы",
+        "Staged Changes": "Индексированные изменения",
+        "Branch Changes": "Изменения ветки",
+        "Added": "Добавлено",
+        "Untracked": "Не отслеживается",
+        "GitHub Personal Access Token": "Персональный токен доступа GitHub (PAT)",
+        "GitHub Policies": "Политики GitHub",
+        "GitHub Permissions": "Разрешения GitHub",
+        "Failed to Generate Commit Message": "Не удалось сгенерировать сообщение коммита",
+        "Commit succeeded": "Коммит успешно создан",
+        "Failed to Commit": "Не удалось закоммитить",
+        "Failed to Amend": "Не удалось дополнить коммит",
+        "Push succeeded": "Отправка (push) успешна",
+        "Failed to Push": "Не удалось отправить (push)",
+        "Export as PDF": "Экспортировать в PDF",
+        "Open in Notebook View": "Открыть в виде блокнота",
+        "Download": "Скачать",
+        "Open Blame in Code Search": "Открыть Blame в Code Search",
+        "Trajectory Debug View": "Отладка траектории",
+        "Open on phone": "Открыть на телефоне",
+        "Unstage change": "Убрать из индекса",
+        "Stage change": "Индексировать изменение",
+        "Discard unstaged changes": "Отменить неиндексированные изменения",
+        "Configure GitHub access policies.": "Настроить политики доступа GitHub.",
+        "Uploaded project files and in-chat attachments are stored on Google servers and mounted into your cloud sandbox so your agent can read and work with them.": "Загруженные файлы проекта и вложения чата сохраняются на серверах Google и подключаются в облачную песочницу для работы агента.",
+        "Files, folders, and repositories you connect are accessible to your agent in this project, including during background or scheduled runs.": "Подключённые файлы, папки и репозитории доступны агенту в этом проекте, в том числе во время фоновых и запланированных запусков.",
+        "Match when any modified file path starts with the given depot prefix.": "Сопоставлять, когда путь изменённого файла начинается с указанного префикса depot.",
+        "Match when push_def equals or is a child of the given PushDef prefix.": "Сопоставлять, когда push_def совпадает или наследует указанный префикс PushDef.",
+        "Manage fine-grained permissions for GitHub.": "Управление детальными разрешениями для GitHub.",
+
+        // Workspaces & Environments
+        "Default workspace VCS": "VCS рабочей области по умолчанию",
+        "Sync JJ worktrees to head": "Синхронизировать JJ worktrees с HEAD",
+        "Override feature environment": "Переопределить окружение функций",
+        "Host Environment": "Окружение хоста",
+        "Workspace URI query parameter": "Параметр запроса URI рабочей области",
+        "CitC workspace type": "Тип воркспейса CitC",
+        "Access grants": "Права доступа",
+        "Manifest Changes": "Изменения манифеста",
+        "CitC Workspace": "Рабочая область CitC",
+        "Cog Workspace": "Рабочая область Cog",
+        "ABFS Workspace (Alpha)": "Рабочая область ABFS (Alpha)",
+        "Worktree": "Worktree",
+        "CitC Clone": "Клон CitC",
+        "Repo": "Репозиторий",
+        "Idle": "Ожидание",
+        "Open Folder (Interactive)": "Открыть папку (интерактивно)",
+        "Current workspace": "Текущая рабочая область",
+        "Archive Workspace": "Архивировать рабочую область",
+        "Stored and mounted in your cloud environment": "Сохранено и подключено в вашем облачном окружении",
+        "Files and resources in cloud workspaces": "Файлы и ресурсы в облачных рабочих областях",
+        "Daily environment time used": "Использовано времени окружения за день",
+        "Could not create Cog workspace": "Не удалось создать воркспейс Cog",
+        "Workspace setup warning": "Предупреждение настройки рабочей области",
+        "More cloud environments": "Другие облачные окружения",
+        "Failed to create worktree": "Не удалось создать worktree",
+        "Failed to create CitC clone workspace": "Не удалось создать клон воркспейса CitC",
+        "Switch Roles": "Сменить роли",
+        "VCS used when creating a new workspace, including workspaces generated based off your initial prompt.": "VCS для новых рабочих областей, включая области, созданные по вашему начальному запросу.",
+        "When enabled, the values below replace the auto-detected OS, host, and user type used for feature gating.": "Если включено, значения ниже заменяют автоматически определённые ОС, хост и тип пользователя для проверки доступности функций.",
+        "Simulate a different host (Electron, desktop or mobile Web, Extension, remote control, or installed PWA).": "Эмулировать другой хост (Electron, браузер, расширение, удалённое управление или PWA).",
+        "Select the workspace type that will be used for new conversations started with the New Workspace option.": "Выберите тип рабочей области для новых диалогов, запускаемых с параметром «Новая рабочая область».",
+        "Commands and files these agents can use.": "Команды и файлы, доступные этим агентам.",
+        "Clone current workspace into a new independent workspace": "Клонировать текущую рабочую область в новую независимую область",
+
+        // Security & Permissions
+        "1. Accessibility": "1. Универсальный доступ",
+        "2. Screen Recording": "2. Запись экрана",
+        "Screen Recording": "Запись экрана",
+        "View site information": "Сведения о сайте",
+        "Attackers might be able to see the images you're looking at on this site and trick you by modifying them.": "Злоумышленники могут видеть просматриваемые изображения на этом сайте и подменять их.",
+        "Controls whether terminal commands require your approval before running.": "Определяет, требуется ли ваше подтверждение перед запуском команд в терминале.",
+        "Gemini 4 Carbon now available!": "Gemini 4 Carbon теперь доступна!",
+        "Both Carbon and Argon are now included as part of the entire Gemini entitlement, so you can use them for much longer.": "И Carbon, и Argon теперь включены в общий лимит Gemini, поэтому вы сможете использовать их намного дольше.",
+        "For your hardest, long-horizon tasks": "Для самых сложных и масштабных задач",
+        "Are you sure you want to delete this conversation?": "Вы уверены, что хотите удалить этот диалог?",
+        "This action cannot be undone.": "Это действие нельзя отменить.",
+        "Runs on this machine": "Запускается на этом компьютере",
+        "Open File": "Открыть файл",
+        "Search or enter a URL": "Поиск или введите URL",
+        "Model cannot be changed while the agent is running": "Нельзя сменить модель, пока агент работает",
+        "Permissions cannot be changed while the agent is running": "Нельзя изменить разрешения, пока агент работает",
+        "Restart to Update": "Перезапустить для обновления",
+        "Restart to Update →": "Перезапустить для обновления →",
+        "Restart to Update ->": "Перезапустить для обновления →",
+        "Check for Updates": "Проверить обновления",
+        "Checking for Updates": "Проверка обновлений",
+        "Checking for Updates...": "Проверка обновлений...",
+        "Downloading Update": "Загрузка обновления",
+        "Downloading Update...": "Загрузка обновления...",
+        "Update Available": "Доступно обновление",
+        "Update Ready": "Обновление готово",
+        "Install Update": "Установить обновление",
+        "Installing Update...": "Установка обновления...",
+        "Update Failed": "Ошибка обновления",
+        "Retry Update": "Повторить обновление",
+        "Up to Date": "Актуальная версия",
+        "Raw": "Исходник",
+        "Switch to RTL text direction": "Переключить направление текста (RTL)",
+        "Switch to LTR text direction": "Переключить направление текста (LTR)",
+        "View Diff": "Показать отличия",
+        "Open in Antigravity IDE": "Открыть в Antigravity IDE",
+        "Table options": "Параметры таблицы",
+        "Copy as Markdown": "Копировать как Markdown",
+        "Maximize Width": "Развернуть по ширине",
+        "Stage and commit all changes": "Индексировать и закоммитить все изменения",
+        "No commits to push": "Нет коммитов для отправки",
     };
 
     const EXACT_LOWER_RU = Object.create(null);
@@ -1340,7 +1568,35 @@ function agyI18nBootstrap() {
         [/^Please list the steps to reproduce/i, "Опишите шаги воспроизведения..."],
         [/^Describe the bug you encountered/i, "Опишите возникшую ошибку..."],
         [/^Untitled$/i, "Без названия"],
+        // Search & Input Placeholders
+        [/^Turn on a flag you don't have/i, "Включить недоступный флаг"],
+        [/^Select or enter a workspace URI/i, "Выберите или введите URI рабочей области"],
+        [/^New hook name/i, "Имя нового хука"],
+        [/^Paste code/i, "Вставьте код"],
+        [/^Type absolute path or navigate folders/i, "Введите абсолютный путь или перейдите по папкам..."],
+        [/^\(Optional\) Tell us more or type your reason/i, "(Необязательно) Расскажите подробнее или укажите причину..."],
+        [/^What should this coordinator accomplish/i, "Какую цель должен решить этот координатор?"],
+        [/^For example: every morning, summarize new bugs/i, "Например: каждое утро собирать сводку назначенных мне багов и ночных изменений."],
+        [/^For example: Morning bug summary/i, "Например: Утренняя сводка багов"],
+        [/^Target text in PDF/i, "Искомый текст в PDF..."],
     ];
+
+    function pluralRu(n, one, few, many) {
+        const num = Math.abs(Number(n)) || 0;
+        const m10 = num % 10;
+        const m100 = num % 100;
+        if (m10 === 1 && m100 !== 11) return one;
+        if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return few;
+        return many;
+    }
+
+    function formatAttachmentCountRu(countStr, kindStr) {
+        const n = parseInt(countStr, 10) || 0;
+        const k = String(kindStr || "").trim().toLowerCase();
+        if (k === "image") return n + " " + pluralRu(n, "вложенное изображение", "вложенных изображения", "вложенных изображений");
+        if (k === "file") return n + " " + pluralRu(n, "вложенный файл", "вложенных файла", "вложенных файлов");
+        return n + " " + pluralRu(n, "вложение", "вложения", "вложений");
+    }
 
     function translateGreetingTail(tail) {
         if (!tail) return "";
@@ -1353,6 +1609,8 @@ function agyI18nBootstrap() {
     }
 
     const REGEX_RU = [
+        [/^Are you sure you want to delete the\s+(.+)\?$/i, "Вы уверены, что хотите удалить $1?"],
+        [/^This will permanently delete (\d+) active conversations? within it\.$/i, "Это безвозвратно удалит $1 активных диалогов внутри."],
         // Home Screen & Onboarding Greetings (comma optional, preserving user's name + optional trailing question)
         [/^(Good morning|Good afternoon|Good evening|Good night|Welcome back|Welcome|Hello|Hi|Hey|Ready to work),?\s+([^.!?]+)([.!?])\s+(.+)$/i, (_, greet, name, punct, tail) => {
             const gMap = {
@@ -1406,12 +1664,32 @@ function agyI18nBootstrap() {
         [/^Sign in from the (.+?) panel\.$/i, (_, p) => "Войдите через панель " + p + "."],
 
         // Model availability, Quota, Limits & Usage Popover
-        [/^(.+?)\s+is currently available to\s+(.+?)\s+plan subscribers\.$/i, (_, m, t) => m + " сейчас доступна подписчикам тарифа " + t + "."],
-        [/^(.+?)\s+are available on paid\s+(.+?)\s+plans\. Third-party model access will no longer be available on your current plan starting on\s+(.+?)\.$/i, (_, m, t, d) => m + " доступны на платных тарифах " + t + ". Доступ к сторонним моделям на вашем текущем тарифе прекратится с " + d + "."],
+        [/^(.+?)\s+is currently available to\s+(.+?)\s*(?:plan\s+)?subscribers\.?$/i, (_, m, t) => {
+            const ruPlans = formatPlanListRu(t, true);
+            const prefix = ruPlans.includes("и") || ruPlans.includes("или") ? "тарифов " : "тарифа ";
+            return m + " сейчас доступна подписчикам " + prefix + ruPlans + ".";
+        }],
+        [/^(.+?)\s+(?:is now|is|are)\s+available on\s+(?:paid\s+)?(.+?)\s+plans?\.\s*Third-party model access will no longer be available on your current plan starting on\s+(.+?)\.?$/i, (_, m, t, d) => {
+            const ruPlans = formatPlanListRu(t, false);
+            const ruDate = formatFullDateRu(d).replace(/\.+$/, "");
+            const prefix = ruPlans.includes("и") || ruPlans.includes("или") ? "платных тарифах " : "платном тарифе ";
+            return m + " доступна на " + prefix + ruPlans + ". Доступ к сторонним моделям на вашем текущем тарифе прекратится с " + ruDate + ".";
+        }],
+        [/^Use (.+?) for better quality with lower quota usage\.?$/i, (_, m) => "Используйте " + m + " для лучшего качества при меньшем расходе квоты."],
         [/^For paid (.+?) plans,\s*(.+?) quota is separate\.\s*Higher .+? quota \(included as part of the larger (.+?) quota bucket\) is available on (.+?) plans\.$/i, (_, p1, m, b, p2) => "На платных тарифах " + p1 + " квота " + m + " отдельная. Повышенная квота " + m + " (в составе общей квоты " + b + ") доступна на тарифах " + p2 + "."],
         [/^Models within this group:\s*(.+)$/i, (_, list) => "Модели в этой группе: " + list],
         [/^(.+?)\s+is available on\s+(.+?)\s+plans?\.$/i, (_, m, t) => m + " доступна на тарифах " + t + "."],
         [/^(.+?)\s+will be removed from Antigravity on\s+(.+?)\.?$/i, (_, m, d) => m + " будет удалена из Antigravity " + d + "."],
+        [/^(.+?)\.?\s*Leaving on\s+([A-Za-z]+)\s+(\d{1,2})\.?$/i, (_, prefix, month, day) => {
+            const ruMonth = formatMonthRu(month);
+            const cleanPrefix = prefix.trim().replace(/\.$/, "");
+            const ruPrefix = EXACT_RU[cleanPrefix] || cleanPrefix;
+            return (ruPrefix ? ruPrefix + ". " : "") + "Будет отключена " + day + " " + ruMonth + ".";
+        }],
+        [/^Leaving on\s+([A-Za-z]+)\s+(\d{1,2})\.?$/i, (_, month, day) => {
+            const ruMonth = formatMonthRu(month);
+            return "Будет отключена " + day + " " + ruMonth + ".";
+        }],
         [/^You can upgrade to a (.+?) plan to receive higher rate limits\.$/i, (_, plan) => "Вы можете перейти на тариф " + plan + " для увеличения лимитов."],
         [/^Your Plan:\s*(.+)$/i, (_, p) => "Ваш тариф: " + p],
         [/^Available AI Credits:\s*(.+)$/i, (_, c) => "Доступно AI-кредитов: " + c],
@@ -1447,7 +1725,20 @@ function agyI18nBootstrap() {
         [/^Send feedback as\s+(.+)$/i, (_, email) => "Отправить отзыв от имени " + email],
         [/^Cancel\s*\(([^)]+)\)$/i, (_, k) => "Отмена (" + k + ")"],
         [/^Comment\s*\(([^)]+)\)$/i, (_, k) => "Комментарий (" + k + ")"],
+        [/^Available on\s+(paid\s+)?(.+?)\s+plans?\.\s*Not included with your current plan\.?$/i, (_, paid, plans) => "Доступно на " + (paid ? "платных тарифах " : "тарифах ") + formatPlanListRu(plans, false) + ". Не входит в ваш текущий тариф."],
+        [/^Available on\s+(paid\s+)?(.+?)\s+plans?\.?$/i, (_, paid, plans) => "Доступно на " + (paid ? "платных тарифах " : "тарифах ") + formatPlanListRu(plans, false) + "."],
+        [/^Match Whole Word(?:\s*\(([^)]+)\))?$/i, (_, key) => "Слово целиком" + (key ? " (" + key + ")" : "")],
+        [/^Match Case(?:\s*\(([^)]+)\))?$/i, (_, key) => "Учитывать регистр" + (key ? " (" + key + ")" : "")],
+        [/^Use Regular Expression(?:\s*\(([^)]+)\))?$/i, (_, key) => "Регулярное выражение" + (key ? " (" + key + ")" : "")],
+        [/^Updated\s+(\d+:\d+(?::\d+)?|just now|\d+\s*(?:[smhd]|sec|min|hr|day|mo|yr|second|minute|hour|day|week|month|year)s?(?:\s+ago)?)$/i, (_, t) => /^just now$/i.test(t) ? "Обновлено только что" : "Обновлено " + formatDurationRu(t)],
+        [/^Restart to Update(?:\s*(?:->|→))?$/i, (m) => m.includes("→") ? "Перезапустить для обновления →" : "Перезапустить для обновления"],
+        [/^Previous Match(?:\s*\(([^)]+)\))?$/i, (_, key) => "Предыдущее совпадение" + (key ? " (" + key + ")" : "")],
+        [/^Next Match(?:\s*\(([^)]+)\))?$/i, (_, key) => "Следующее совпадение" + (key ? " (" + key + ")" : "")],
+        [/^Close(?:\s*\(([^)]+)\))?$/i, (_, key) => "Закрыть" + (key ? " (" + key + ")" : "")],
+        [/^(\d+)\s+of\s+(\d+)$/i, (_, a, b) => a + " из " + b],
         [/^\+(\d+)\s+more\s+lines?$/i, (_, n) => "+" + n + " ещё строк"],
+        [/^\(\s*(\d+)\s+(?:(image|file|media|video|audio)\s+)?attachments?\s*\)$/i, (_, n, kind) => "(" + formatAttachmentCountRu(n, kind) + ")"],
+        [/^(\d+)\s+(?:(image|file|media|video|audio)\s+)?attachments?$/i, (_, n, kind) => formatAttachmentCountRu(n, kind)],
         [/^(\+?\s*)See (\d+) more$/i, (_, p, n) => p + "Показать ещё " + n],
         [/^Mondays at (.+)$/i, (_, t) => "По понедельникам в " + t],
         [/^Tuesdays at (.+)$/i, (_, t) => "По вторникам в " + t],
@@ -1514,11 +1805,11 @@ function agyI18nBootstrap() {
 
         // Dynamic counts, timestamps, versions & durations
         [/^Version\s+(.+)$/, (_, v) => "Версия " + v],
-        [/^Updated\s+(.+)$/, (_, t) => "Обновлено " + formatDurationRu(t)],
-        [/^Last updated\s+(.+)$/i, (_, t) => "Обновлено " + formatDurationRu(t)],
-        [/^Created\s+(.+)$/, (_, t) => "Создано " + formatDurationRu(t)],
-        [/^Edited\s+(.+)$/, (_, t) => "Изменено " + formatDurationRu(t)],
-        [/^Started\s+(.+)$/, (_, t) => "Запущено " + formatDurationRu(t)],
+        [/^Updated\s+(just\s+now|<\s*1\s*m(?:\s+ago)?|\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)(?:(?:\s+|,\s*)\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?))*(?:\s+ago)?)$/, (_, t) => "Обновлено " + formatDurationRu(t)],
+        [/^Last updated\s+(just\s+now|<\s*1\s*m(?:\s+ago)?|\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)(?:(?:\s+|,\s*)\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?))*(?:\s+ago)?)$/i, (_, t) => "Обновлено " + formatDurationRu(t)],
+        [/^Created\s+(just\s+now|<\s*1\s*m(?:\s+ago)?|\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)(?:(?:\s+|,\s*)\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?))*(?:\s+ago)?)$/, (_, t) => "Создано " + formatDurationRu(t)],
+        [/^Edited\s+(just\s+now|<\s*1\s*m(?:\s+ago)?|\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)(?:(?:\s+|,\s*)\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?))*(?:\s+ago)?)$/, (_, t) => "Изменено " + formatDurationRu(t)],
+        [/^Started\s+(just\s+now|<\s*1\s*m(?:\s+ago)?|\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)(?:(?:\s+|,\s*)\d+\s*(?:mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?))*(?:\s+ago)?)$/, (_, t) => "Запущено " + formatDurationRu(t)],
         [/^Thought for (.+)$/, (_, t) => "Думал " + formatDurationRu(t)],
         [/^Thinking for (.+)$/, (_, t) => "Думает " + formatDurationRu(t)],
         [/^Worked for (.+)$/, (_, t) => "Работал " + formatDurationRu(t)],
@@ -1576,15 +1867,69 @@ function agyI18nBootstrap() {
     let observer = null;
     let isMutating = false;
 
+    function hasAncestorMatching(el, pred) {
+        let cur = el;
+        while (cur && cur.nodeType === 1) {
+            if (pred(cur)) return true;
+            cur = cur.parentElement;
+        }
+        return false;
+    }
+
+    function isBranchOrFileContext(node) {
+        const el = node && (node.nodeType === 1 ? node : node.parentElement);
+        if (!el) return false;
+        return hasAncestorMatching(el, (cur) => {
+            const tid = (typeof cur.getAttribute === "function" ? cur.getAttribute("data-testid") : "") || "";
+            const cls = typeof cur.className === "string" ? cur.className : "";
+            const role = (typeof cur.getAttribute === "function" ? cur.getAttribute("role") : "") || "";
+            if (
+                (typeof cur.hasAttribute === "function" && (cur.hasAttribute("data-branch") || cur.hasAttribute("data-branch-name") || cur.hasAttribute("data-file-path") || cur.hasAttribute("data-file-uri"))) ||
+                /(?:branch|git|file-tree|file-list|changed-files|source-control|worktree)/i.test(tid) ||
+                /(?:branch|git-ref|file-tree|file-list)/i.test(cls)
+            ) {
+                return true;
+            }
+            if ((role === "option" || role === "treeitem") && /(?:branch|file|ref|git)/i.test(tid + " " + cls)) {
+                return true;
+            }
+            return false;
+        });
+    }
+
     function shouldSkipElement(el, forAttr = false) {
         if (!el || el.nodeType !== 1) return true;
         if (forAttr ? SKIP_ATTR_TAGS.has(el.tagName) : SKIP_TEXT_TAGS.has(el.tagName)) return true;
         if (el.id && SKIP_IDS.has(el.id)) return true;
         if (!forAttr && el.isContentEditable) return true;
-        if (el.closest("pre, code, .monaco-editor, .cm-editor, .agy-user-bubble, [data-agy-no-i18n]")) return true;
-        if (!forAttr && el.closest('[data-testid="project-header"], [data-testid="tab-file-tree-sidebar"] [role="treeitem"]')) {
+
+        // 1. Always skip code lines, diff lines, syntax tokens, terminals, and editors
+        if (el.closest("pre, code, kbd, samp, .monaco-editor, .cm-editor, .monaco-diff-editor, .code-line, .line-content, [data-testid='code-gutter-diff'], [data-testid='diff-gutter-strip'], .xterm, .terminal, .agy-user-bubble, [data-agy-no-i18n]")) {
+            return true;
+        }
+
+        // 2. Diff viewer and code block containers: allow toolbar/search UI & hunk expanders, skip actual code/diff text
+        if (el.closest(".file-viewer-root, .code-block, .diff-view-mode-detail, [data-file-uri], [data-diff-type], .bottom-terminal-panel")) {
+            if (!el.closest("button, [role='button'], [role='menuitem'], [role='tab'], [role='dialog'], [role='tooltip'], [role='search'], [role='status']")) {
+                const rawHint = forAttr ? "" : String(el.textContent || "").trim();
+                const allowDiffUiLabel = /^(?:\+\d+\s+more\s+lines?|No Results|\d+\s+of\s+\d+)$/i.test(rawHint);
+                if (!allowDiffUiLabel) return true;
+            }
+        }
+
+        // 3. User project header, conversation rows, file trees, and non-tree file/branch lists: protect titles/paths/branches
+        if (!forAttr && (
+            el.closest('[data-testid="project-header"], [data-testid="conversation-row-sidebar"], [data-testid="conversation-row-history"], [data-testid="tab-file-tree-sidebar"] [role="treeitem"], [data-testid="tab-file-tree-sidebar"] [role="listitem"], [data-testid="tab-file-tree-sidebar"] [role="row"], [data-testid="branch-list"], [data-testid="file-list"], [data-file-path], [data-branch-name]') ||
+            hasAncestorMatching(el, (cur) => {
+                const tid = (typeof cur.getAttribute === "function" ? cur.getAttribute("data-testid") : "") || "";
+                const cls = typeof cur.className === "string" ? cur.className : "";
+                return /(?:^|[-_])(?:branch-list|file-list|changed-files-list)(?:$|[-_])|tab-file-tree-sidebar/i.test(tid) || /\b(?:branch-list|file-list)\b/i.test(cls);
+            })
+        )) {
             if (!el.closest('[role="menu"], [role="menuitem"], [role="tooltip"], [role="dialog"]')) return true;
         }
+
+        // 4. Markdown body in assistant response: protect prose / code from accidental word mutations
         if (el.closest("[data-main-content-body]")) {
             if (el.closest(".prose, [class*='markdown'], [data-testid*='markdown']")) {
                 if (!el.closest("button, [role='button'], [role='menuitem'], [role='tab'], [role='dialog']")) return true;
@@ -1650,9 +1995,22 @@ function agyI18nBootstrap() {
             }
         }
 
-        if (EXACT_RU[norm]) return preserveOuterSpaces(raw, EXACT_RU[norm]);
+        if (EXACT_RU[norm]) {
+            if ((norm === "Branch" || norm === "Status") && isBranchOrFileContext(node)) return null;
+            return preserveOuterSpaces(raw, EXACT_RU[norm]);
+        }
         const low = norm.toLowerCase();
-        if (EXACT_LOWER_RU[low]) return preserveOuterSpaces(raw, EXACT_LOWER_RU[low]);
+        if (EXACT_LOWER_RU[low]) {
+            if ((low === "branch" || low === "status") && isBranchOrFileContext(node)) return null;
+            return preserveOuterSpaces(raw, EXACT_LOWER_RU[low]);
+        }
+        // Mixed user text + trailing English attachment count suffix e.g. "... (4 image attachments)"
+        const trailingAttach = /^(.+?)\s*\(\s*(\d+)\s+(?:(image|file|media|video|audio)\s+)?attachments?\s*\)$/i.exec(norm);
+        if (trailingAttach) {
+            return preserveOuterSpaces(raw, trailingAttach[1] + " (" + formatAttachmentCountRu(trailingAttach[2], trailingAttach[3]) + ")");
+        }
+        // Fast-path: skip ~100 regexes for pure digits/punctuation or already-Cyrillic text
+        if (!/[A-Za-z]/.test(norm) || /[\u0400-\u04FF]/.test(norm)) return null;
         for (let i = 0; i < REGEX_RU.length; i++) {
             const pair = REGEX_RU[i];
             if (pair[0].test(norm)) {
@@ -1748,6 +2106,16 @@ function agyI18nBootstrap() {
         if (root.matches && root.matches(ATTR_SELECTOR)) {
             applyAttrsToElement(root, isRu);
         }
+        const isDocRoot = root === document.body || root === document.documentElement;
+        if (!isDocRoot && (!root.children || root.children.length === 0)) {
+            if (!shouldSkipElement(root, false) && root.childNodes && root.childNodes.length) {
+                for (let i = 0; i < root.childNodes.length; i++) {
+                    const cn = root.childNodes[i];
+                    if (cn && cn.nodeType === 3) applyToTextNode(cn, isRu);
+                }
+            }
+            return;
+        }
         if (root.querySelectorAll) {
             const list = root.querySelectorAll(ATTR_SELECTOR);
             for (let i = 0; i < list.length; i++) {
@@ -1830,8 +2198,15 @@ function agyI18nBootstrap() {
             const next = lang === "en" ? "en" : "ru";
             const changed = next !== currentLang;
             currentLang = next;
-            applyToSubtree(document.body || document.documentElement);
-            startObserver();
+            if (changed) {
+                applyToSubtree(document.body || document.documentElement);
+            }
+            if (currentLang === "ru") {
+                startObserver();
+            } else if (observer) {
+                try { observer.disconnect(); } catch {}
+                observer = null;
+            }
             if (changed) {
                 window.dispatchEvent(new CustomEvent("agy-lang-changed", { detail: { lang: next } }));
             }
@@ -1845,13 +2220,19 @@ function agyI18nBootstrap() {
         _translateAttrForTest(attr, raw) {
             return translateAttr(attr, raw);
         },
+        _shouldSkipElementForTest(el, forAttr = false) {
+            return shouldSkipElement(el, forAttr);
+        },
+        _isObserverActiveForTest() {
+            return Boolean(observer);
+        },
     };
 
     // Translate entire document.body (including Radix/Floating-UI portals outside #root) immediately
     if (currentLang === "ru") {
         applyToSubtree(document.body || document.documentElement);
+        startObserver();
     }
-    startObserver();
 }
 
 function buildI18nClientJs() {

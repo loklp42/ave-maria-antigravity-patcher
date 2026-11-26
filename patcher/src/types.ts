@@ -7,7 +7,7 @@ export interface PatcherStatus {
   antigravityPath: string;
   customizationFound: boolean;
   version: string;
-  state: "patched" | "original" | "not_found";
+  state: "patched" | "original" | "corrupted" | "not_found";
   hasBackup: boolean;
   asarSize: number;
   wallpaperPath: string;

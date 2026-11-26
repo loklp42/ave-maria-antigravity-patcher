@@ -1,50 +1,77 @@
 "use strict";
+const { serializeContrastHelpers } = require("./agyUiContrast");
 const {
-    parseRgb,
-    relativeLuminance,
-    contrastRatio,
-    blendRgbOver,
-    rgbToHex,
-    getAccessibleTextPalette,
-    ensureReadableAccentOnSurface,
-    normalizeAdaptiveAccent,
-    getAdaptiveThemeTokens,
-} = require("./agyUiContrast");
+    classifyTierType,
+    cleanModelLabel,
+    classifyFamily,
+    normalizeQuotasForTier,
+} = require("./agyAccounts");
 
-function buildContrastHelpersSnippet() {
+function buildQuotaHelpersSnippet() {
     return [
-        parseRgb,
-        relativeLuminance,
-        contrastRatio,
-        blendRgbOver,
-        rgbToHex,
-        getAccessibleTextPalette,
-        ensureReadableAccentOnSurface,
-        normalizeAdaptiveAccent,
-        getAdaptiveThemeTokens,
+        classifyTierType,
+        cleanModelLabel,
+        classifyFamily,
+        normalizeQuotasForTier,
     ].map((fn) => fn.toString()).join("\n");
 }
 
-function buildSharedThemeScript(baseUrl) {
+function buildContrastHelpersSnippet() {
+    return serializeContrastHelpers();
+}
+
+function buildSharedThemeScript(baseUrl, token = "") {
     return `
     const BASE_URL = ${JSON.stringify(baseUrl)};
+    const API_TOKEN = ${JSON.stringify(String(token || ""))};
+    const apiFetch = (pathOrUrl, opts = {}) => {
+        const url = String(pathOrUrl).startsWith("http") ? pathOrUrl : (BASE_URL + pathOrUrl);
+        const headers = Object.assign({}, opts.headers || {});
+        if (API_TOKEN) headers["X-Agy-Token"] = API_TOKEN;
+        return fetch(url, Object.assign({}, opts, { headers }));
+    };
+    const withToken = (url) => {
+        if (!API_TOKEN) return url;
+        return url + (url.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(API_TOKEN);
+    };
     ${buildContrastHelpersSnippet()}
+    ${buildQuotaHelpersSnippet()}
 
     const FONT_MAP = {
         system: "'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif",
         inter: "'Inter', 'Segoe UI Variable', system-ui, sans-serif",
         jetbrains: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
         cascadia: "'Cascadia Code', Consolas, monospace",
+        georgia: "Georgia, 'Times New Roman', serif",
         segoe: "'Segoe UI', Tahoma, sans-serif",
     };
 
     const themeState = {
         lang: "ru",
+        themeMode: "dark",
+        uiContrast: "default",
+        useCustomBg: false,
+        customBgHex: "#0c0e14",
+        useCustomText: false,
+        customTextHex: "#f8fafc",
+        darkUseCustomBg: false,
+        darkCustomBgHex: "#0c0e14",
+        darkUseCustomText: false,
+        darkCustomTextHex: "#f8fafc",
+        darkCustomAccentHex: "#60a5fa",
+        lightUseCustomBg: false,
+        lightCustomBgHex: "#fafbfe",
+        lightUseCustomText: false,
+        lightCustomTextHex: "#111827",
+        lightCustomAccentHex: "#2563eb",
         accentRgb: "96, 165, 250",
         tintRgb: "12, 14, 20",
         customAccentHex: "#60a5fa",
         adaptiveAccent: true,
-        panelAlpha: 0.72,
+        autoContrast: true,
+        lumaBoost: 0,
+        panelAlpha: 0.68,
+        panelBlurPx: 20,
         dim: 0.36,
         videoBlur: 0,
         videoSat: 1.0,
@@ -54,26 +81,155 @@ function buildSharedThemeScript(baseUrl) {
         fontSizePx: 14,
         radiusPx: 10,
         uiFontChoice: "system",
+        reduceBackdropBlur: true,
+        reduceMotion: false,
+        privacyMode: false,
+        privacyRevealMode: "modifier",
+        privacyHideStyle: "blur",
+        privacyHidePaths: true,
         currentId: "",
         currentIndex: 0,
-        videoMuted: true,
-        videoVolume: 0,
+        mediaFilter: "all",
+        hideMature: false,
+        hideLowRes: false,
+        staticWallpaperMode: false,
+        wallpaperEnabled: true,
+        hiddenIds: [],
     };
 
-    function hexToRgbStr(hex) {
+    const EMAIL_MASK_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/g;
+    const WIN_PATH_MASK_RE = /([A-Za-z]:[/\\\\]+Users[/\\\\]+)([^\\\\/\\s,;:"'<>|]+)/gi;
+    const UNIX_PATH_MASK_RE = /(\\/(?:home|Users)\\/)([^/\\s,;:"'<>|]+)/g;
+
+    function maskSensitiveString(str, maskPaths = themeState.privacyHidePaths) {
+        let out = String(str || "").replace(EMAIL_MASK_RE, "••••@••••");
+        if (maskPaths) {
+            out = out
+                .replace(WIN_PATH_MASK_RE, "$1••••")
+                .replace(UNIX_PATH_MASK_RE, "$1••••");
+        }
+        return out;
+    }
+
+    function formatPrivacyValue(raw, isEmailField = false) {
+        const str = String(raw || "");
+        if (!themeState.privacyMode) return str;
+        if (themeState.privacyHideStyle !== "mask") return str;
+        let out = maskSensitiveString(str, themeState.privacyHidePaths);
+        if (isEmailField && out === str && str.includes("@")) {
+            out = "••••@••••";
+        }
+        return out;
+    }
+
+    function getSafePrivacyTip(raw) {
+        const str = String(raw || "");
+        if (!themeState.privacyMode) return str;
+        return maskSensitiveString(str, themeState.privacyHidePaths);
+    }
+
+    function syncModHeld(held) {
+        const root = document.documentElement;
+        if (!root || !root.dataset) return;
+        const active = Boolean(held && themeState.privacyMode && themeState.privacyRevealMode === "modifier");
+        root.dataset.agyModHeld = active ? "1" : "0";
+    }
+    if (typeof window.addEventListener === "function") {
+        const onKeyMod = (e) => syncModHeld(Boolean(e && (e.altKey || e.ctrlKey)));
+        window.addEventListener("keydown", onKeyMod, true);
+        window.addEventListener("keyup", onKeyMod, true);
+        window.addEventListener("blur", () => syncModHeld(false));
+    }
+
+    const sysDarkMq = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+    function resolveShellThemeMode() {
+        if (themeState.themeMode === "light") return "light";
+        if (themeState.themeMode === "dark") return "dark";
+        return (sysDarkMq && typeof sysDarkMq.matches === "boolean") ? (sysDarkMq.matches ? "dark" : "light") : "dark";
+    }
+
+    function hexToRgbStr(hex, fallback = "96, 165, 250") {
         const clean = String(hex || "").replace("#", "").trim();
-        if (!/^[0-9a-fA-F]{6}$/.test(clean)) return "96, 165, 250";
+        if (!/^[0-9a-fA-F]{6}$/.test(clean)) return fallback;
         return parseInt(clean.slice(0, 2), 16) + ", " + parseInt(clean.slice(2, 4), 16) + ", " + parseInt(clean.slice(4, 6), 16);
+    }
+
+    function registerShellCustomFonts(fonts) {
+        if (!Array.isArray(fonts)) return;
+        const css = fonts.map((f) => {
+            if (!f || !f.family || !f.urlPath) return "";
+            const url = withToken(BASE_URL + f.urlPath);
+            const safeFam = String(f.family).replace(/["\\\\]/g, "");
+            const fmt = String(f.format || "truetype").replace(/[^a-z0-9-]/gi, "");
+            return '@font-face{font-family:"' + safeFam + '";src:url("' + url + '") format("' + fmt + '");font-weight:100 900;font-style:normal;font-display:swap;}';
+        }).filter(Boolean).join("\\n");
+        let el = document.getElementById("agy-shell-custom-fonts");
+        if (!el) {
+            el = document.createElement("style");
+            el.id = "agy-shell-custom-fonts";
+            (document.head || document.documentElement).appendChild(el);
+        }
+        el.textContent = css;
     }
 
     function hydrateTheme(cfg, extras) {
         if (cfg && typeof cfg === "object") {
             if (cfg.lang === "en" || cfg.lang === "ru") themeState.lang = cfg.lang;
-            if (typeof cfg.customAccentHex === "string" && /^#[0-9a-fA-F]{6}$/.test(cfg.customAccentHex)) themeState.customAccentHex = cfg.customAccentHex;
-            if (typeof cfg.adaptiveAccent === "boolean") themeState.adaptiveAccent = cfg.adaptiveAccent;
+            if (cfg.themeMode === "dark" || cfg.themeMode === "light" || cfg.themeMode === "system") themeState.themeMode = cfg.themeMode;
+            if (cfg.uiContrast === "default" || cfg.uiContrast === "high") themeState.uiContrast = cfg.uiContrast;
+            for (const bk of ["darkUseCustomBg", "darkUseCustomText", "lightUseCustomBg", "lightUseCustomText", "reduceBackdropBlur", "reduceMotion", "adaptiveAccent", "autoContrast", "privacyMode", "privacyHidePaths"]) {
+                if (typeof cfg[bk] === "boolean") themeState[bk] = cfg[bk];
+            }
+            if (cfg.privacyRevealMode === "never" || cfg.privacyRevealMode === "modifier" || cfg.privacyRevealMode === "hover") {
+                themeState.privacyRevealMode = cfg.privacyRevealMode;
+            }
+            if (cfg.privacyHideStyle === "blur" || cfg.privacyHideStyle === "mask") {
+                themeState.privacyHideStyle = cfg.privacyHideStyle;
+            }
+            for (const hk of ["darkCustomBgHex", "darkCustomTextHex", "darkCustomAccentHex", "lightCustomBgHex", "lightCustomTextHex", "lightCustomAccentHex"]) {
+                if (typeof cfg[hk] === "string" && /^#[0-9a-fA-F]{6}$/.test(cfg[hk])) themeState[hk] = cfg[hk].toLowerCase();
+            }
+            const effModeForLegacy = resolveShellThemeMode();
+            if (typeof cfg.useCustomBg === "boolean") {
+                themeState.useCustomBg = cfg.useCustomBg;
+                if (typeof cfg.darkUseCustomBg !== "boolean" && typeof cfg.lightUseCustomBg !== "boolean") {
+                    if (effModeForLegacy === "light") themeState.lightUseCustomBg = cfg.useCustomBg;
+                    else themeState.darkUseCustomBg = cfg.useCustomBg;
+                }
+            }
+            if (typeof cfg.customBgHex === "string" && /^#[0-9a-fA-F]{6}$/.test(cfg.customBgHex)) {
+                themeState.customBgHex = cfg.customBgHex.toLowerCase();
+                if (!cfg.darkCustomBgHex && !cfg.lightCustomBgHex) {
+                    if (effModeForLegacy === "light") themeState.lightCustomBgHex = themeState.customBgHex;
+                    else themeState.darkCustomBgHex = themeState.customBgHex;
+                }
+            }
+            if (typeof cfg.useCustomText === "boolean") {
+                themeState.useCustomText = cfg.useCustomText;
+                if (typeof cfg.darkUseCustomText !== "boolean" && typeof cfg.lightUseCustomText !== "boolean") {
+                    if (effModeForLegacy === "light") themeState.lightUseCustomText = cfg.useCustomText;
+                    else themeState.darkUseCustomText = cfg.useCustomText;
+                }
+            }
+            if (typeof cfg.customTextHex === "string" && /^#[0-9a-fA-F]{6}$/.test(cfg.customTextHex)) {
+                themeState.customTextHex = cfg.customTextHex.toLowerCase();
+                if (!cfg.darkCustomTextHex && !cfg.lightCustomTextHex) {
+                    if (effModeForLegacy === "light") themeState.lightCustomTextHex = themeState.customTextHex;
+                    else themeState.darkCustomTextHex = themeState.customTextHex;
+                }
+            }
+            if (typeof cfg.customAccentHex === "string" && /^#[0-9a-fA-F]{6}$/.test(cfg.customAccentHex)) {
+                themeState.customAccentHex = cfg.customAccentHex.toLowerCase();
+                if (!cfg.darkCustomAccentHex && !cfg.lightCustomAccentHex) {
+                    if (effModeForLegacy === "light") themeState.lightCustomAccentHex = themeState.customAccentHex;
+                    else themeState.darkCustomAccentHex = themeState.customAccentHex;
+                }
+            }
             if (typeof cfg.accentRgb === "string" && cfg.accentRgb) themeState.accentRgb = cfg.accentRgb;
             if (typeof cfg.tintRgb === "string" && cfg.tintRgb) themeState.tintRgb = cfg.tintRgb;
-            if (Number.isFinite(Number(cfg.panelAlpha))) themeState.panelAlpha = Math.max(0.25, Math.min(0.96, Number(cfg.panelAlpha)));
+            if (Number.isFinite(Number(cfg.panelAlpha))) themeState.panelAlpha = Math.max(0, Math.min(1, Number(cfg.panelAlpha)));
+            if (Number.isFinite(Number(cfg.panelBlurPx))) themeState.panelBlurPx = Math.max(0, Math.min(32, Math.round(Number(cfg.panelBlurPx))));
+            if (Number.isFinite(Number(cfg.lumaBoost))) themeState.lumaBoost = Math.max(0, Math.min(0.92, Number(cfg.lumaBoost)));
             if (Number.isFinite(Number(cfg.dim))) themeState.dim = Math.max(0, Math.min(0.92, Number(cfg.dim)));
             if (Number.isFinite(Number(cfg.videoBlur))) themeState.videoBlur = Math.max(0, Math.min(28, Number(cfg.videoBlur)));
             if (Number.isFinite(Number(cfg.videoSat))) themeState.videoSat = Math.max(0.2, Math.min(2.2, Number(cfg.videoSat)));
@@ -85,46 +241,162 @@ function buildSharedThemeScript(baseUrl) {
             if (typeof cfg.uiFontChoice === "string" && cfg.uiFontChoice.trim()) themeState.uiFontChoice = cfg.uiFontChoice.trim();
             if (typeof cfg.currentId === "string") themeState.currentId = cfg.currentId;
             if (Number.isFinite(Number(cfg.currentIndex))) themeState.currentIndex = Number(cfg.currentIndex);
-            if (typeof cfg.privacyMode === "boolean") themeState.privacyMode = cfg.privacyMode;
+            if (cfg.mediaFilter === "all" || cfg.mediaFilter === "video" || cfg.mediaFilter === "image") themeState.mediaFilter = cfg.mediaFilter;
+            if (typeof cfg.hideMature === "boolean") themeState.hideMature = cfg.hideMature;
+            if (typeof cfg.hideLowRes === "boolean") themeState.hideLowRes = cfg.hideLowRes;
+            if (typeof cfg.staticWallpaperMode === "boolean") themeState.staticWallpaperMode = cfg.staticWallpaperMode;
+            if (typeof cfg.wallpaperEnabled === "boolean") themeState.wallpaperEnabled = cfg.wallpaperEnabled;
+            if (Array.isArray(cfg.hiddenIds)) themeState.hiddenIds = cfg.hiddenIds.filter((x) => typeof x === "string");
         }
         if (extras && typeof extras === "object") {
             if (extras.lang === "en" || extras.lang === "ru") themeState.lang = extras.lang;
         }
     }
 
+    const shellVarCache = new Map();
+    const shellDataCache = new Map();
+    let lastShellColorScheme = "";
+    function setShellVar(rootStyle, name, value) {
+        const v = String(value);
+        if (shellVarCache.get(name) === v) return;
+        shellVarCache.set(name, v);
+        rootStyle.setProperty(name, v);
+    }
+    function setShellData(dataset, key, value) {
+        const v = String(value);
+        if (shellDataCache.get(key) === v && dataset[key] === v) return;
+        shellDataCache.set(key, v);
+        dataset[key] = v;
+    }
+
     function applySharedThemeVars() {
         const root = document.documentElement;
-        const accentRgb = themeState.adaptiveAccent && themeState.accentRgb
+        const effMode = resolveShellThemeMode();
+        const highContrast = themeState.uiContrast === "high";
+        const useBg = effMode === "light" ? !!themeState.lightUseCustomBg : !!themeState.darkUseCustomBg;
+        const bgHex = effMode === "light" ? (themeState.lightCustomBgHex || "#fafbfe") : (themeState.darkCustomBgHex || "#0c0e14");
+        const useText = effMode === "light" ? !!themeState.lightUseCustomText : !!themeState.darkUseCustomText;
+        const textHex = effMode === "light" ? (themeState.lightCustomTextHex || "#111827") : (themeState.darkCustomTextHex || "#f8fafc");
+        const customAccHex = effMode === "light" ? (themeState.lightCustomAccentHex || "#2563eb") : (themeState.darkCustomAccentHex || "#60a5fa");
+
+        const plainBg = themeState.wallpaperEnabled === false;
+        const accentRgb = !plainBg && themeState.adaptiveAccent && themeState.accentRgb
             ? themeState.accentRgb
-            : hexToRgbStr(themeState.customAccentHex);
-        const tintRgb = themeState.tintRgb || "12, 14, 20";
-        const tokens = getAdaptiveThemeTokens(tintRgb, accentRgb, 0.24);
-        const surf = tokens.surface || {};
+            : hexToRgbStr(customAccHex || themeState.customAccentHex, effMode === "light" ? "37, 99, 235" : "96, 165, 250");
+        const tintRgb = useBg
+            ? hexToRgbStr(bgHex, effMode === "light" ? "250, 251, 254" : "12, 14, 20")
+            : (effMode === "light" ? "250, 251, 254" : "12, 14, 20");
+
+        const rawBlur = Number(themeState.panelBlurPx);
+        const safeBlur = Number.isFinite(rawBlur) ? Math.max(0, Math.min(32, Math.round(rawBlur))) : 20;
+        const tok = buildUiDesignTokens({
+            themeMode: themeState.themeMode,
+            effectiveMode: effMode,
+            tintRgb,
+            accentRgb,
+            uiContrast: themeState.uiContrast,
+            panelAlpha: themeState.panelAlpha,
+            reduceBackdropBlur: themeState.reduceBackdropBlur,
+            panelBlurPx: safeBlur,
+            useCustomText: useText,
+            customTextHex: textHex,
+            useCustomBg: useBg,
+            dim: plainBg ? 0 : themeState.dim,
+            lumaBoost: plainBg ? 0 : (themeState.lumaBoost || 0),
+        });
+        const layers = tok.layers;
         const r = Math.round(themeState.radiusPx);
         const rSm = Math.max(0, Math.round(r * 0.7));
         const font = FONT_MAP[themeState.uiFontChoice] || themeState.uiFontChoice || FONT_MAP.system;
+        const panelBlur = tok.panelBlurPx;
+        const blurSkip = !themeState.reduceBackdropBlur && (panelBlur <= 0 || layers.panelAlpha >= 0.96);
 
-        root.style.setProperty("--agy-accent-rgb", accentRgb);
-        root.style.setProperty("--agy-tint-rgb", tintRgb);
-        root.style.setProperty("--agy-ui-font", font);
-        root.style.setProperty("--agy-base-font-size", themeState.fontSizePx + "px");
-        root.style.setProperty("--agy-radius", r + "px");
-        root.style.setProperty("--agy-radius-sm", rSm + "px");
-        root.style.setProperty("--agy-panel-alpha", String(themeState.panelAlpha));
-        root.dataset.agyPrivacy = themeState.privacyMode ? "1" : "0";
-        root.style.setProperty("--agy-wp-dim", String(themeState.dim));
-        root.style.setProperty("--agy-text-primary", surf.primary || "#f1f5f9");
-        root.style.setProperty("--agy-text-muted", surf.secondary || "#cbd5e1");
-        root.style.setProperty("--agy-text-subtle", surf.subtle || "#94a3b8");
-        root.style.setProperty("--agy-border", surf.border || "rgba(255,255,255,0.14)");
-        root.style.setProperty("--agy-on-solid-accent", tokens.onSolidAccent || "#000000");
-        root.style.setProperty("--agy-on-tinted-accent", tokens.onTintedAccent || "#ffffff");
-        root.style.setProperty("--agy-accent-text", tokens.accentText || "#93c5fd");
-        return tokens;
+        setShellData(root.dataset, "agyThemeMode", tok.effectiveMode);
+        setShellData(root.dataset, "agySurface", tok.isLightSurface ? "light" : "dark");
+        setShellData(root.dataset, "agyContrast", highContrast ? "high" : "default");
+        setShellData(root.dataset, "agyNoBlur", (themeState.reduceBackdropBlur || blurSkip) ? "1" : "0");
+        setShellData(root.dataset, "agyReduceMotion", themeState.reduceMotion ? "1" : "0");
+        const plainBgVal = plainBg ? "1" : "0";
+        if (root.dataset.agyPlainBg !== plainBgVal) root.dataset.agyPlainBg = plainBgVal;
+        setShellData(root.dataset, "agyPrivacy", themeState.privacyMode ? "1" : "0");
+        setShellData(root.dataset, "agyPrivacyReveal", themeState.privacyRevealMode || "modifier");
+        setShellData(root.dataset, "agyPrivacyStyle", themeState.privacyHideStyle || "blur");
+        setShellData(root.dataset, "agyPrivacyPaths", themeState.privacyHidePaths !== false ? "1" : "0");
+        if (!themeState.privacyMode || themeState.privacyRevealMode !== "modifier") {
+            setShellData(root.dataset, "agyModHeld", "0");
+        }
+        const nextScheme = tok.isLightSurface ? "light" : "dark";
+        if (lastShellColorScheme !== nextScheme) {
+            lastShellColorScheme = nextScheme;
+            root.style.colorScheme = nextScheme;
+        }
+
+        const rs = root.style;
+        setShellVar(rs, "--agy-accent-rgb", tok.accentRgb);
+        setShellVar(rs, "--agy-tint-rgb", tok.tintRgb);
+        setShellVar(rs, "--agy-ui-font", font);
+        setShellVar(rs, "--agy-base-font-size", themeState.fontSizePx + "px");
+        setShellVar(rs, "--agy-radius", r + "px");
+        setShellVar(rs, "--agy-radius-sm", rSm + "px");
+        setShellVar(rs, "--agy-panel-alpha", String(layers.panelAlpha));
+        setShellVar(rs, "--agy-panel-blur", (blurSkip ? 0 : panelBlur) + "px");
+        setShellVar(rs, "--agy-surface-base-alpha", layers.baseAlpha.toFixed(3));
+        setShellVar(rs, "--agy-surface-sidebar-alpha", layers.sidebarAlpha.toFixed(3));
+        setShellVar(rs, "--agy-surface-card-alpha", layers.cardAlpha.toFixed(3));
+        setShellVar(rs, "--agy-surface-composer-alpha", layers.composerAlpha.toFixed(3));
+        setShellVar(rs, "--agy-surface-modal-alpha", layers.modalAlpha.toFixed(3));
+        setShellVar(rs, "--agy-surface-base", tok.surfaceBase);
+        setShellVar(rs, "--agy-surface-sidebar", tok.surfaceSidebar);
+        setShellVar(rs, "--agy-surface-card", tok.surfaceCard);
+        setShellVar(rs, "--agy-surface-composer", tok.surfaceComposer);
+        setShellVar(rs, "--agy-surface-modal", tok.surfaceDialog || tok.surfaceModal);
+        setShellVar(rs, "--agy-surface-dialog", tok.surfaceDialog || tok.surfaceModal);
+        setShellVar(rs, "--agy-surface-popover", tok.surfacePopover);
+        setShellVar(rs, "--agy-surface-sticky", tok.surfaceSticky || tok.surfacePopover);
+        setShellVar(rs, "--agy-backdrop-bg", tok.backdropBg);
+        setShellVar(rs, "--agy-nav-bg", tok.navBg);
+        setShellVar(rs, "--agy-card-bg", tok.cardBg);
+        setShellVar(rs, "--agy-hc-scrim-lift", String(layers.hcScrimLift));
+        setShellVar(rs, "--agy-wp-dim", String(themeState.dim));
+        setShellVar(rs, "--agy-scrim-opacity", String(tok.scrimOpacity));
+
+        setShellVar(rs, "--agy-fg", tok.fg);
+        setShellVar(rs, "--agy-fg-secondary", tok.fgSecondary);
+        setShellVar(rs, "--agy-fg-muted", tok.fgMuted);
+        setShellVar(rs, "--agy-fg-subtle", tok.fgSubtle);
+        setShellVar(rs, "--agy-text-primary", tok.fg);
+        setShellVar(rs, "--agy-text-muted", tok.fgMuted);
+        setShellVar(rs, "--agy-text-subtle", tok.fgSubtle);
+        setShellVar(rs, "--agy-border", tok.border);
+        setShellVar(rs, "--agy-border-strong", tok.borderStrong);
+        setShellVar(rs, "--agy-divider", tok.divider);
+        setShellVar(rs, "--agy-hover-bg", tok.hoverBg);
+        setShellVar(rs, "--agy-subtle-bg", tok.subtleBg);
+        setShellVar(rs, "--agy-subtle-bg-strong", tok.subtleBgStrong);
+        setShellVar(rs, "--agy-shadow-card", tok.shadowCard);
+        setShellVar(rs, "--agy-shadow-panel", tok.shadowPanel);
+        setShellVar(rs, "--agy-danger-fg", tok.dangerFg);
+        setShellVar(rs, "--agy-warn-fg", tok.warnFg);
+        setShellVar(rs, "--agy-ok-fg", tok.okFg);
+        setShellVar(rs, "--agy-on-solid-accent", tok.onSolidAccent);
+        setShellVar(rs, "--agy-on-tinted-accent", tok.onTintedAccent);
+        setShellVar(rs, "--agy-accent-text", tok.accentText);
+        return tok;
+    }
+
+    if (sysDarkMq) {
+        const onSys = () => { if (themeState.themeMode === "system") applySharedThemeVars(); };
+        if (typeof sysDarkMq.addEventListener === "function") sysDarkMq.addEventListener("change", onSys);
+        else if (typeof sysDarkMq.addListener === "function") sysDarkMq.addListener(onSys);
     }
 
     function esc(s) {
-        return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        return String(s || "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
     }
 
     function getAccountTitle(acc, ru) {
@@ -144,7 +416,7 @@ function buildSharedThemeScript(baseUrl) {
     function getStatusMeta(acc, ru) {
         const st = acc?.status || "stopped";
         if (st === "starting") return { key: "starting", label: ru ? "Запуск..." : "Starting...", color: "rgb(var(--agy-accent-rgb))" };
-        if (st === "waiting") return { key: "waiting", label: ru ? "Ждёт ответа" : "Waiting", color: "#f59e0b" };
+        if (st === "waiting") return { key: "waiting", label: ru ? "Ждёт ответа" : "Waiting", color: "var(--agy-warn-fg, #f59e0b)" };
         if (st === "working") {
             const n = Number(acc?.activeAgentCount || 0);
             return {
@@ -153,17 +425,54 @@ function buildSharedThemeScript(baseUrl) {
                 color: "rgb(var(--agy-accent-rgb))",
             };
         }
-        if (st === "error") return { key: "error", label: ru ? "Ошибка" : "Error", color: "#ef4444" };
-        if (st === "ready" || acc?.tabOpen || acc?.lsRunning) return { key: "ready", label: ru ? "Готов" : "Ready", color: "#22c55e" };
+        if (st === "error") return { key: "error", label: ru ? "Ошибка" : "Error", color: "var(--agy-danger-fg, #ef4444)" };
+        if (st === "ready" || acc?.tabOpen || acc?.lsRunning) return { key: "ready", label: ru ? "Готов" : "Ready", color: "var(--agy-ok-fg, #22c55e)" };
         return { key: "stopped", label: ru ? "Не запущен" : "Stopped", color: "var(--agy-text-subtle)" };
     }
     `;
 }
 
-function renderTabBarHtml(port) {
+function getInitialThemeAttr() {
+    let attrs = "";
+    try {
+        const wp = require("./wallpaperEngine");
+        if (typeof wp.readAppearanceConfig === "function") {
+            const cfg = wp.readAppearanceConfig();
+            if (cfg && typeof cfg === "object") {
+                const rawMode = String(cfg.themeMode || "dark").toLowerCase();
+                let effMode = rawMode === "light" || rawMode === "dark" ? rawMode : "dark";
+                if (rawMode === "system") {
+                    try {
+                        const { nativeTheme } = require("electron");
+                        if (nativeTheme && typeof nativeTheme.shouldUseDarkColors === "boolean") {
+                            effMode = nativeTheme.shouldUseDarkColors ? "dark" : "light";
+                        }
+                    } catch {}
+                }
+                const isLightSurface = effMode === "light";
+                const noBlur = cfg.reduceBackdropBlur ? "1" : "0";
+                const contrast = cfg.uiContrast === "high" ? "high" : "default";
+                attrs += ` data-agy-theme-mode="${effMode}" data-agy-surface="${isLightSurface ? "light" : "dark"}" data-agy-contrast="${contrast}" data-agy-no-blur="${noBlur}"`;
+                const rev = cfg.privacyRevealMode === "never" || cfg.privacyRevealMode === "hover" ? cfg.privacyRevealMode : "modifier";
+                const sty = cfg.privacyHideStyle === "mask" ? "mask" : "blur";
+                const paths = cfg.privacyHidePaths === false ? "0" : "1";
+                const priv = cfg.privacyMode ? "1" : "0";
+                attrs += ` data-agy-privacy="${priv}" data-agy-privacy-reveal="${rev}" data-agy-privacy-style="${sty}" data-agy-privacy-paths="${paths}"`;
+            }
+        }
+    } catch {}
+    return attrs;
+}
+
+function getInitialPrivacyAttr() {
+    return getInitialThemeAttr();
+}
+
+function renderTabBarHtml(port, token = "") {
     const baseUrl = `http://127.0.0.1:${Number(port)}`;
+    const privAttr = getInitialThemeAttr();
     return `<!doctype html>
-<html lang="ru">
+<html lang="ru"${privAttr}>
 <head>
 <meta charset="utf-8">
 <title>Antigravity Tabs</title>
@@ -175,12 +484,42 @@ function renderTabBarHtml(port) {
         --agy-base-font-size: 14px;
         --agy-radius: 10px;
         --agy-radius-sm: 7px;
-        --agy-text-primary: #f1f5f9;
-        --agy-text-muted: #94a3b8;
-        --agy-text-subtle: #64748b;
-        --agy-border: rgba(255, 255, 255, 0.12);
+        --agy-surface-sidebar: rgba(12, 14, 20, 0.85);
+        --agy-fg: #f8fafc;
+        --agy-fg-muted: #b8c4d4;
+        --agy-fg-subtle: #8b9bb0;
+        --agy-text-primary: var(--agy-fg);
+        --agy-text-muted: var(--agy-fg-muted);
+        --agy-text-subtle: var(--agy-fg-subtle);
+        --agy-border: rgba(255, 255, 255, 0.15);
+        --agy-border-strong: rgba(255, 255, 255, 0.26);
+        --agy-divider: rgba(255, 255, 255, 0.11);
+        --agy-hover-bg: rgba(255, 255, 255, 0.08);
+        --agy-subtle-bg: rgba(255, 255, 255, 0.06);
+        --agy-subtle-bg-strong: rgba(255, 255, 255, 0.14);
+        --agy-danger-fg: #fca5a5;
+        --agy-warn-fg: #fcd34d;
+        --agy-ok-fg: #86efac;
         --agy-on-tinted-accent: #ffffff;
         --agy-accent-text: #93c5fd;
+    }
+    html[data-agy-surface="light"] {
+        --agy-tint-rgb: 250, 251, 254;
+        --agy-surface-sidebar: rgba(250, 251, 254, 0.85);
+        --agy-fg: #111827;
+        --agy-fg-muted: #475569;
+        --agy-fg-subtle: #64748b;
+        --agy-border: rgba(15, 23, 42, 0.16);
+        --agy-border-strong: rgba(15, 23, 42, 0.28);
+        --agy-divider: rgba(15, 23, 42, 0.12);
+        --agy-hover-bg: rgba(255, 255, 255, 0.54);
+        --agy-subtle-bg: rgba(248, 250, 252, 0.56);
+        --agy-subtle-bg-strong: rgba(241, 245, 249, 0.74);
+        --agy-danger-fg: #b91c1c;
+        --agy-warn-fg: #b45309;
+        --agy-ok-fg: #15803d;
+        --agy-on-tinted-accent: #1e293b;
+        --agy-accent-text: #2563eb;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -188,7 +527,7 @@ function renderTabBarHtml(port) {
         height: 100%;
         overflow: hidden;
         background: rgb(var(--agy-tint-rgb));
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
         font-family: var(--agy-ui-font);
         font-size: var(--agy-base-font-size);
         user-select: none;
@@ -201,8 +540,8 @@ function renderTabBarHtml(port) {
         width: 100%;
         padding: 0 144px 0 8px;
         gap: 6px;
-        background: rgba(var(--agy-tint-rgb), 0.96);
-        border-bottom: 1px solid var(--agy-border);
+        background: var(--agy-surface-sidebar);
+        border-bottom: 1px solid var(--agy-divider);
         -webkit-app-region: drag;
     }
     .picker-btn {
@@ -214,8 +553,8 @@ function renderTabBarHtml(port) {
         padding: 0 10px;
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
-        background: rgba(255, 255, 255, 0.05);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg);
+        color: var(--agy-fg);
         font: inherit;
         font-size: 0.84em;
         font-weight: 600;
@@ -224,7 +563,7 @@ function renderTabBarHtml(port) {
         transition: background 0.12s ease, border-color 0.12s ease;
     }
     .picker-btn:hover {
-        background: rgba(255, 255, 255, 0.11);
+        background: var(--agy-hover-bg);
     }
     .picker-btn.active {
         background: rgba(var(--agy-accent-rgb), 0.22);
@@ -255,27 +594,38 @@ function renderTabBarHtml(port) {
         padding: 0 7px 0 8px;
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
-        background: rgba(255, 255, 255, 0.04);
-        color: var(--agy-text-muted);
+        background: var(--agy-subtle-bg);
+        color: var(--agy-fg-muted);
         cursor: pointer;
         flex-shrink: 0;
-        transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+        transition: background 0.18s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.18s cubic-bezier(0.16, 1, 0.3, 1), color 0.18s ease, transform 0.14s ease;
     }
-    .tab:hover {
-        background: rgba(255, 255, 255, 0.09);
-        color: var(--agy-text-primary);
+    html[data-agy-contrast="high"] .tab,
+    html[data-agy-contrast="high"] .picker-btn,
+    html[data-agy-contrast="high"] .tab-add-btn,
+    html[data-agy-contrast="high"] .tab-close {
+        border-color: var(--agy-border-strong);
+    }
+    html[data-agy-contrast="high"] :is(.tab, .picker-btn, .tab-add-btn, .tab-close):focus-visible {
+        outline: 2px solid rgba(var(--agy-accent-rgb), 0.9);
+        outline-offset: 1px;
+    }
+    .tab:hover:not(.active) {
+        background: var(--agy-hover-bg);
+        color: var(--agy-fg);
+        transform: translateY(-1px);
     }
     .tab.active {
         background: rgba(var(--agy-accent-rgb), 0.19);
         border-color: rgba(var(--agy-accent-rgb), 0.58);
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
     }
     .tab-av {
         width: 20px;
         height: 20px;
         border-radius: calc(var(--agy-radius-sm) * 0.65);
-        background: rgba(255, 255, 255, 0.11);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg-strong);
+        color: var(--agy-fg);
         font-size: 0.68em;
         font-weight: 700;
         display: flex;
@@ -290,15 +640,19 @@ function renderTabBarHtml(port) {
         object-fit: cover;
         display: block;
     }
-    html[data-agy-privacy="1"] .tab-email {
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"] .tab-email {
         filter: blur(4.5px);
         opacity: 0.78;
         transition: filter 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease;
     }
-    html[data-agy-privacy="1"] .tab:hover .tab-email,
-    html[data-agy-privacy="1"] .tab-email:hover {
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="hover"] .tab-email:hover,
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="modifier"][data-agy-mod-held="1"] .tab-email:hover {
         filter: none;
         opacity: 1;
+    }
+    html[data-agy-privacy="1"][data-agy-privacy-style="mask"] .tab-email {
+        letter-spacing: 0.04em;
+        opacity: 0.85;
     }
     .tab-meta {
         display: flex;
@@ -358,12 +712,16 @@ function renderTabBarHtml(port) {
         justify-content: center;
         flex-shrink: 0;
         opacity: 0.65;
-        transition: background 0.1s ease, opacity 0.1s ease, color 0.1s ease;
+        transition: background 0.16s ease, opacity 0.16s ease, color 0.16s ease, transform 0.14s ease;
     }
     .tab-close:hover {
         background: rgba(239, 68, 68, 0.24);
-        color: #fca5a5;
+        color: var(--agy-danger-fg);
         opacity: 1;
+        transform: scale(1.08);
+    }
+    .tab-close:active {
+        transform: scale(0.92);
     }
     .add-btn {
         -webkit-app-region: no-drag;
@@ -372,7 +730,7 @@ function renderTabBarHtml(port) {
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
         background: transparent;
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
         cursor: pointer;
         display: inline-flex;
         align-items: center;
@@ -381,12 +739,12 @@ function renderTabBarHtml(port) {
         transition: background 0.12s ease, color 0.12s ease;
     }
     .add-btn:hover {
-        background: rgba(255, 255, 255, 0.09);
-        color: var(--agy-text-primary);
+        background: var(--agy-hover-bg);
+        color: var(--agy-fg);
     }
     .hint {
         font-size: 0.78em;
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
         padding: 0 8px;
         white-space: nowrap;
     }
@@ -400,16 +758,17 @@ function renderTabBarHtml(port) {
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
         background: transparent;
-        color: var(--agy-text-subtle);
+        color: var(--agy-fg-subtle);
         cursor: pointer;
         -webkit-app-region: no-drag;
         transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
     }
     .tab-add-btn:hover {
-        background: rgba(255, 255, 255, 0.08);
+        background: var(--agy-hover-bg);
         border-color: var(--agy-border);
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
     }
+    html[data-agy-reduce-motion="1"] * { transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; }
 </style>
 </head>
 <body>
@@ -422,7 +781,7 @@ function renderTabBarHtml(port) {
 </div>
 <script>
 (() => {
-    ${buildSharedThemeScript(baseUrl)}
+    ${buildSharedThemeScript(baseUrl, token)}
 
     let snapshot = { activeId: "", viewMode: "picker", openTabOrder: [], accounts: [] };
     let lastReportedHeight = 0;
@@ -431,7 +790,7 @@ function renderTabBarHtml(port) {
         const target = Math.max(36, Math.min(54, Math.round(themeState.fontSizePx * 2.85)));
         if (target !== lastReportedHeight) {
             lastReportedHeight = target;
-            fetch(BASE_URL + "/tabs/bar-height", {
+            apiFetch("/tabs/bar-height", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ height: target }),
@@ -471,7 +830,10 @@ function renderTabBarHtml(port) {
 
             const tab = document.createElement("div");
             tab.className = "tab" + (isActive ? " active" : "");
-            tab.title = title + (acc.email ? " (" + acc.email + ")" : "") + (showActiveStatus ? (" — " + st.label) : "");
+            const dispTitle = formatPrivacyValue(title, title.includes("@"));
+            const dispSubEmail = formatPrivacyValue(subEmail, true);
+            const safeTipTitle = getSafePrivacyTip((themeState.privacyMode && title.includes("@")) ? (ru ? "Аккаунт" : "Account") : title);
+            tab.title = safeTipTitle + (!themeState.privacyMode && acc.email ? " (" + acc.email + ")" : "") + (showActiveStatus ? (" — " + st.label) : "");
 
             const av = document.createElement("div");
             av.className = "tab-av";
@@ -482,20 +844,20 @@ function renderTabBarHtml(port) {
             meta.className = "tab-meta";
             meta.innerHTML =
                 '<div class="tab-name-row">' +
-                    '<span class="tab-name">' + esc(title) + '</span>' +
+                    '<span class="tab-name' + (title.includes("@") ? ' tab-email' : '') + '">' + esc(dispTitle) + '</span>' +
                 '</div>' +
                 '<div class="tab-sub">' +
                     (showActiveStatus ? ('<span class="st-text" style="color:' + st.color + ';">' + esc(st.label) + '</span>' + (subEmail ? '<span>·</span>' : '')) : '') +
-                    (subEmail ? '<span class="tab-email" style="overflow:hidden;text-overflow:ellipsis;">' + esc(subEmail) + '</span>' : (!showActiveStatus ? '<span>' + esc(st.label) + '</span>' : '')) +
+                    (subEmail ? '<span class="tab-email" style="overflow:hidden;text-overflow:ellipsis;">' + esc(dispSubEmail) + '</span>' : (!showActiveStatus ? '<span>' + esc(st.label) + '</span>' : '')) +
                 '</div>';
 
             const closeBtn = document.createElement("button");
             closeBtn.className = "tab-close";
-            closeBtn.title = ru ? "Закрыть вкладку и остановить сервер" : "Close tab & stop server";
+            closeBtn.title = ru ? "Закрыть вкладку" : "Close tab";
             closeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
             closeBtn.onclick = (e) => {
                 e.stopPropagation();
-                fetch(BASE_URL + "/tabs/close", {
+                apiFetch("/tabs/close", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ id }),
@@ -503,7 +865,7 @@ function renderTabBarHtml(port) {
             };
 
             tab.onclick = () => {
-                fetch(BASE_URL + "/tabs/open", {
+                apiFetch("/tabs/open", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ id }),
@@ -519,21 +881,23 @@ function renderTabBarHtml(port) {
         addBtn.title = ru ? "Открыть или добавить аккаунт" : "Open or add account";
         addBtn.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
         addBtn.onclick = () => {
-            fetch(BASE_URL + "/tabs/show-picker", { method: "POST" }).catch(() => {});
+            apiFetch("/tabs/show-picker", { method: "POST" }).catch(() => {});
         };
         tabsEl.appendChild(addBtn);
     }
 
     document.getElementById("btn-picker").onclick = () => {
-        fetch(BASE_URL + "/tabs/show-picker", { method: "POST" }).catch(() => {});
+        apiFetch("/tabs/show-picker", { method: "POST" }).catch(() => {});
     };
 
     function refreshAll() {
         Promise.all([
-            fetch(BASE_URL + "/config").then((r) => r.json()).catch(() => ({})),
-            fetch(BASE_URL + "/extras/config").then((r) => r.json()).catch(() => ({})),
-            fetch(BASE_URL + "/accounts/list").then((r) => r.json()).catch(() => null),
-        ]).then(([cfg, ex, accRes]) => {
+            apiFetch("/config").then((r) => r.json()).catch(() => ({})),
+            apiFetch("/extras/config").then((r) => r.json()).catch(() => ({})),
+            apiFetch("/accounts/list").then((r) => r.json()).catch(() => null),
+            apiFetch("/fonts/list").then((r) => r.json()).catch(() => ({ fonts: [] })),
+        ]).then(([cfg, ex, accRes, fontRes]) => {
+            if (fontRes && Array.isArray(fontRes.fonts)) registerShellCustomFonts(fontRes.fonts);
             hydrateTheme(cfg, ex);
             applySharedThemeVars();
             syncBarHeight();
@@ -545,7 +909,13 @@ function renderTabBarHtml(port) {
     refreshAll();
 
     try {
-        const es = new EventSource(BASE_URL + "/events");
+        const es = new EventSource(withToken(BASE_URL + "/events"));
+        es.addEventListener("fonts", (ev) => {
+            try {
+                const payload = JSON.parse(ev.data);
+                if (payload && Array.isArray(payload.fonts)) registerShellCustomFonts(payload.fonts);
+            } catch {}
+        });
         es.addEventListener("accounts", (ev) => {
             try {
                 const data = JSON.parse(ev.data);
@@ -558,20 +928,24 @@ function renderTabBarHtml(port) {
         es.addEventListener("config", (ev) => {
             try {
                 const cfg = JSON.parse(ev.data);
+                const prevSig = [themeState.lang, themeState.privacyMode, themeState.privacyHideStyle, themeState.privacyRevealMode, themeState.privacyHidePaths].join("|");
                 hydrateTheme(cfg, null);
                 applySharedThemeVars();
                 syncBarHeight();
-                render();
+                const nextSig = [themeState.lang, themeState.privacyMode, themeState.privacyHideStyle, themeState.privacyRevealMode, themeState.privacyHidePaths].join("|");
+                if (nextSig !== prevSig) render();
             } catch {}
         });
         es.addEventListener("extras", (ev) => {
             try {
                 const ex = JSON.parse(ev.data);
+                const prevLang = themeState.lang;
                 hydrateTheme(null, ex);
                 applySharedThemeVars();
-                render();
+                if (themeState.lang !== prevLang) render();
             } catch {}
         });
+        window.addEventListener("pagehide", () => { try { es.close(); } catch {} });
     } catch {}
 })();
 </script>
@@ -579,10 +953,11 @@ function renderTabBarHtml(port) {
 </html>`;
 }
 
-function renderPickerHtml(port) {
+function renderPickerHtml(port, token = "") {
     const baseUrl = `http://127.0.0.1:${Number(port)}`;
+    const privAttr = getInitialThemeAttr();
     return `<!doctype html>
-<html lang="ru">
+<html lang="ru"${privAttr}>
 <head>
 <meta charset="utf-8">
 <title>Antigravity — Accounts</title>
@@ -594,15 +969,55 @@ function renderPickerHtml(port) {
         --agy-base-font-size: 14px;
         --agy-radius: 10px;
         --agy-radius-sm: 7px;
-        --agy-panel-alpha: 0.76;
-        --agy-wp-dim: 0.42;
-        --agy-text-primary: #f1f5f9;
-        --agy-text-muted: #94a3b8;
-        --agy-text-subtle: #64748b;
-        --agy-border: rgba(255, 255, 255, 0.12);
+        --agy-panel-alpha: 0.68;
+        --agy-surface-card-alpha: 0.698;
+        --agy-surface-modal-alpha: 0.773;
+        --agy-surface-card: rgba(12, 14, 20, 0.698);
+        --agy-surface-modal: rgba(12, 14, 20, 0.773);
+        --agy-hc-scrim-lift: 0;
+        --agy-wp-dim: 0.36;
+        --agy-fg: #f8fafc;
+        --agy-fg-muted: #b8c4d4;
+        --agy-fg-subtle: #8b9bb0;
+        --agy-text-primary: var(--agy-fg);
+        --agy-text-muted: var(--agy-fg-muted);
+        --agy-text-subtle: var(--agy-fg-subtle);
+        --agy-border: rgba(255, 255, 255, 0.15);
+        --agy-border-strong: rgba(255, 255, 255, 0.26);
+        --agy-divider: rgba(255, 255, 255, 0.11);
+        --agy-hover-bg: rgba(255, 255, 255, 0.08);
+        --agy-subtle-bg: rgba(255, 255, 255, 0.06);
+        --agy-subtle-bg-strong: rgba(255, 255, 255, 0.14);
+        --agy-shadow-card: 0 10px 30px rgba(0, 0, 0, 0.36);
+        --agy-shadow-panel: 0 18px 46px rgba(0, 0, 0, 0.42);
+        --agy-danger-fg: #fca5a5;
+        --agy-warn-fg: #fcd34d;
+        --agy-ok-fg: #86efac;
         --agy-on-solid-accent: #000000;
         --agy-on-tinted-accent: #ffffff;
         --agy-accent-text: #93c5fd;
+    }
+    html[data-agy-surface="light"] {
+        --agy-tint-rgb: 250, 251, 254;
+        --agy-surface-card: rgba(250, 251, 254, 0.698);
+        --agy-surface-modal: rgba(250, 251, 254, 0.773);
+        --agy-fg: #111827;
+        --agy-fg-muted: #475569;
+        --agy-fg-subtle: #64748b;
+        --agy-border: rgba(15, 23, 42, 0.16);
+        --agy-border-strong: rgba(15, 23, 42, 0.28);
+        --agy-divider: rgba(15, 23, 42, 0.12);
+        --agy-hover-bg: rgba(255, 255, 255, 0.54);
+        --agy-subtle-bg: rgba(248, 250, 252, 0.56);
+        --agy-subtle-bg-strong: rgba(241, 245, 249, 0.74);
+        --agy-shadow-card: 0 8px 24px rgba(15, 23, 42, 0.10);
+        --agy-shadow-panel: 0 16px 40px rgba(15, 23, 42, 0.14);
+        --agy-danger-fg: #b91c1c;
+        --agy-warn-fg: #b45309;
+        --agy-ok-fg: #15803d;
+        --agy-on-solid-accent: #ffffff;
+        --agy-on-tinted-accent: #1e293b;
+        --agy-accent-text: #2563eb;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -610,7 +1025,7 @@ function renderPickerHtml(port) {
         height: 100%;
         overflow: hidden;
         background: rgb(var(--agy-tint-rgb));
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
         font-family: var(--agy-ui-font);
         font-size: var(--agy-base-font-size);
         -webkit-font-smoothing: antialiased;
@@ -633,7 +1048,14 @@ function renderPickerHtml(port) {
     .bg-dim {
         position: absolute;
         inset: 0;
-        background: rgba(var(--agy-tint-rgb), var(--agy-wp-dim));
+        background: rgb(var(--agy-tint-rgb));
+        opacity: var(--agy-scrim-opacity, min(0.92, calc(var(--agy-wp-dim) + var(--agy-hc-scrim-lift))));
+    }
+    html[data-agy-plain-bg="1"] .bg-layer video,
+    html[data-agy-plain-bg="1"] .bg-layer img,
+    html[data-agy-plain-bg="1"] .bg-dim {
+        display: none !important;
+        opacity: 0 !important;
     }
     .page {
         position: relative;
@@ -661,9 +1083,10 @@ function renderPickerHtml(port) {
         flex-wrap: wrap;
         padding: 18px 20px;
         border-radius: var(--agy-radius);
-        background: rgba(var(--agy-tint-rgb), var(--agy-panel-alpha));
-        backdrop-filter: blur(22px);
+        background: var(--agy-surface-card);
+        backdrop-filter: blur(var(--agy-panel-blur, 20px));
         border: 1px solid var(--agy-border);
+        box-shadow: var(--agy-shadow-card);
     }
     .header-left h1 {
         font-size: 1.45em;
@@ -693,12 +1116,13 @@ function renderPickerHtml(port) {
         padding: 0 0.8em;
         border-radius: var(--agy-radius-sm);
         border: 1px solid var(--agy-border);
-        background: rgba(255, 255, 255, 0.06);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg);
+        color: var(--agy-fg);
         font: inherit;
         font-size: 0.90em;
         outline: none;
     }
+    .inp::placeholder { color: var(--agy-fg-subtle); }
     .inp:focus {
         border-color: rgba(var(--agy-accent-rgb), 0.72);
     }
@@ -707,8 +1131,8 @@ function renderPickerHtml(port) {
         padding: 0 1em;
         border-radius: var(--agy-radius-sm);
         border: 1px solid var(--agy-border);
-        background: rgba(255, 255, 255, 0.07);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg);
+        color: var(--agy-fg);
         font: inherit;
         font-size: 0.88em;
         font-weight: 600;
@@ -717,10 +1141,16 @@ function renderPickerHtml(port) {
         align-items: center;
         gap: 7px;
         white-space: nowrap;
-        transition: background 0.12s ease, border-color 0.12s ease;
+        transition: transform 0.16s cubic-bezier(0.16, 1, 0.3, 1), background 0.18s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.18s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.18s ease;
     }
     .btn:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.13);
+        transform: translateY(-1px);
+        background: var(--agy-hover-bg);
+        border-color: var(--agy-border-strong);
+        box-shadow: var(--agy-shadow-card);
+    }
+    .btn:active:not(:disabled) {
+        transform: translateY(0) scale(0.97);
     }
     .btn:disabled {
         opacity: 0.55;
@@ -733,25 +1163,28 @@ function renderPickerHtml(port) {
     }
     .btn-primary:hover:not(:disabled) {
         background: rgba(var(--agy-accent-rgb), 0.36);
+        box-shadow: 0 4px 18px rgba(var(--agy-accent-rgb), 0.30);
     }
     .banner {
         display: none;
         padding: 12px 15px;
         border-radius: var(--agy-radius-sm);
-        background: rgba(var(--agy-tint-rgb), 0.90);
+        background: var(--agy-surface-modal);
+        backdrop-filter: blur(var(--agy-panel-blur, 20px));
+        -webkit-backdrop-filter: blur(var(--agy-panel-blur, 20px));
         border: 1px solid rgba(var(--agy-accent-rgb), 0.55);
         font-size: 0.88em;
         line-height: 1.4;
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
     }
     .banner.show { display: flex; flex-direction: column; gap: 8px; }
-    .banner.error { border-color: rgba(239, 68, 68, 0.65); color: #fecaca; }
+    .banner.error { border-color: rgba(239, 68, 68, 0.65); color: var(--agy-danger-fg); }
     .banner-bar {
         display: none;
         width: 100%;
         height: 3px;
         border-radius: 2px;
-        background: rgba(255, 255, 255, 0.12);
+        background: var(--agy-subtle-bg-strong);
         overflow: hidden;
     }
     .banner.loading .banner-bar { display: block; }
@@ -777,16 +1210,40 @@ function renderPickerHtml(port) {
         gap: 12px;
         padding: 16px;
         border-radius: var(--agy-radius);
-        background: rgba(var(--agy-tint-rgb), var(--agy-panel-alpha));
-        backdrop-filter: blur(22px);
+        background: var(--agy-surface-card);
+        backdrop-filter: blur(var(--agy-panel-blur, 20px));
         border: 1px solid var(--agy-border);
-        transition: border-color 0.14s ease, background 0.14s ease;
+        box-shadow: var(--agy-shadow-card);
+        transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.22s ease, background 0.22s ease, box-shadow 0.22s ease;
     }
+    html[data-agy-no-blur="1"] .header,
+    html[data-agy-no-blur="1"] .card,
+    html[data-agy-no-blur="1"] .banner {
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+    }
+    html[data-agy-contrast="high"] .header,
+    html[data-agy-contrast="high"] .card,
+    html[data-agy-contrast="high"] .inp,
+    html[data-agy-contrast="high"] .btn,
+    html[data-agy-contrast="high"] .icon-btn,
+    html[data-agy-contrast="high"] .tag,
+    html[data-agy-contrast="high"] .quotas-box {
+        border-color: var(--agy-border-strong);
+    }
+    html[data-agy-contrast="high"] :is(.inp, .btn, .icon-btn, .card):focus-visible {
+        outline: 2px solid rgba(var(--agy-accent-rgb), 0.9);
+        outline-offset: 1px;
+    }
+    html[data-agy-reduce-motion="1"] * { transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; }
     .card:hover {
+        transform: translateY(-2px);
         border-color: rgba(var(--agy-accent-rgb), 0.52);
+        box-shadow: var(--agy-shadow-panel);
     }
     .card.is-open {
         border-color: rgba(var(--agy-accent-rgb), 0.68);
+        box-shadow: 0 6px 20px rgba(var(--agy-accent-rgb), 0.18);
     }
     .card-top {
         display: flex;
@@ -798,8 +1255,8 @@ function renderPickerHtml(port) {
         width: 42px;
         height: 42px;
         border-radius: var(--agy-radius-sm);
-        background: rgba(255, 255, 255, 0.10);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg-strong);
+        color: var(--agy-fg);
         font-size: 0.95em;
         font-weight: 700;
         display: flex;
@@ -827,15 +1284,24 @@ function renderPickerHtml(port) {
         margin-top: 2px;
         transition: filter 0.22s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.22s ease;
     }
-    html[data-agy-privacy="1"] .ident-email {
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"] .ident-email,
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"] .ident-name.is-email {
         filter: blur(5px);
         opacity: 0.82;
         user-select: none;
     }
-    html[data-agy-privacy="1"] .acc-card:hover .ident-email,
-    html[data-agy-privacy="1"] .ident-email:hover {
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="hover"] .ident-email:hover,
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="hover"] .ident-name.is-email:hover,
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="modifier"][data-agy-mod-held="1"] .ident-email:hover,
+    html[data-agy-privacy="1"][data-agy-privacy-style="blur"][data-agy-privacy-reveal="modifier"][data-agy-mod-held="1"] .ident-name.is-email:hover {
         filter: none;
         opacity: 1;
+    }
+    html[data-agy-privacy="1"][data-agy-privacy-style="mask"] .ident-email,
+    html[data-agy-privacy="1"][data-agy-privacy-style="mask"] .ident-name.is-email {
+        letter-spacing: 0.04em;
+        opacity: 0.86;
+        user-select: none;
     }
     .meta-row {
         display: flex;
@@ -851,18 +1317,18 @@ function renderPickerHtml(port) {
         gap: 6px;
         padding: 3px 8px;
         border-radius: calc(var(--agy-radius-sm) * 0.75);
-        background: rgba(255, 255, 255, 0.06);
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        color: var(--agy-text-primary);
+        background: var(--agy-subtle-bg);
+        border: 1px solid var(--agy-border);
+        color: var(--agy-fg);
         font-weight: 600;
     }
     .tag-muted {
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
         font-weight: 500;
     }
     .tag-warn {
         border-color: rgba(245, 158, 11, 0.55);
-        color: #fcd34d;
+        color: var(--agy-warn-fg);
     }
     .st-sq {
         width: 7px;
@@ -870,6 +1336,15 @@ function renderPickerHtml(port) {
         border-radius: 2px;
         display: inline-block;
         flex-shrink: 0;
+        transition: background 0.25s ease, box-shadow 0.25s ease;
+    }
+    @keyframes agyPulseGlow {
+        0% { box-shadow: 0 0 0 0 rgba(var(--agy-accent-rgb), 0.5); }
+        70% { box-shadow: 0 0 0 5px rgba(var(--agy-accent-rgb), 0); }
+        100% { box-shadow: 0 0 0 0 rgba(var(--agy-accent-rgb), 0); }
+    }
+    .st-sq.working, .st-sq.ready {
+        animation: agyPulseGlow 2.2s infinite;
     }
     .quotas-box {
         display: flex;
@@ -877,8 +1352,8 @@ function renderPickerHtml(port) {
         gap: 7px;
         padding: 10px 11px;
         border-radius: var(--agy-radius-sm);
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.07);
+        background: var(--agy-subtle-bg);
+        border: 1px solid var(--agy-divider);
     }
     .quotas-hdr {
         display: flex;
@@ -886,7 +1361,7 @@ function renderPickerHtml(port) {
         justify-content: space-between;
         gap: 8px;
         font-size: 0.77em;
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
     }
     .tier-name {
         font-weight: 700;
@@ -908,28 +1383,29 @@ function renderPickerHtml(port) {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
     }
     .q-val {
         white-space: nowrap;
         font-variant-numeric: tabular-nums;
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
         font-weight: 600;
     }
     .q-track {
         width: 100%;
         height: 4px;
         border-radius: 2px;
-        background: rgba(255, 255, 255, 0.11);
+        background: var(--agy-subtle-bg-strong);
         overflow: hidden;
     }
     .q-fill {
         height: 100%;
         border-radius: 2px;
+        transition: width 0.45s cubic-bezier(0.16, 1, 0.3, 1), background 0.25s ease;
     }
     .q-empty {
         font-size: 0.80em;
-        color: var(--agy-text-muted);
+        color: var(--agy-fg-muted);
         line-height: 1.35;
     }
     .card-foot {
@@ -951,8 +1427,8 @@ function renderPickerHtml(port) {
         padding: 0 0.55em;
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
-        background: rgba(255, 255, 255, 0.05);
-        color: var(--agy-text-muted);
+        background: var(--agy-subtle-bg);
+        color: var(--agy-fg-muted);
         font: inherit;
         font-size: 0.82em;
         font-weight: 600;
@@ -961,18 +1437,22 @@ function renderPickerHtml(port) {
         align-items: center;
         justify-content: center;
         gap: 5px;
-        transition: background 0.12s ease, color 0.12s ease;
+        transition: transform 0.14s cubic-bezier(0.16, 1, 0.3, 1), background 0.16s ease, color 0.16s ease;
     }
     .icon-btn:hover {
-        background: rgba(255, 255, 255, 0.12);
-        color: var(--agy-text-primary);
+        background: var(--agy-hover-bg);
+        color: var(--agy-fg);
+        transform: translateY(-1px);
+    }
+    .icon-btn:active {
+        transform: translateY(0) scale(0.95);
     }
     .icon-btn.danger {
-        color: #f87171;
+        color: var(--agy-danger-fg);
     }
     .icon-btn.danger:hover {
         background: rgba(239, 68, 68, 0.22);
-        color: #fecaca;
+        color: var(--agy-danger-fg);
     }
     .rename-inp {
         width: 100%;
@@ -980,8 +1460,8 @@ function renderPickerHtml(port) {
         padding: 0 0.6em;
         border-radius: var(--agy-radius-sm);
         border: 1px solid rgba(var(--agy-accent-rgb), 0.7);
-        background: rgba(var(--agy-tint-rgb), 0.95);
-        color: var(--agy-text-primary);
+        background: var(--agy-surface-modal);
+        color: var(--agy-fg);
         font: inherit;
         font-size: 0.92em;
         outline: none;
@@ -996,15 +1476,15 @@ function renderPickerHtml(port) {
         border-radius: var(--agy-radius-sm);
         border: 1px solid transparent;
         background: transparent;
-        color: var(--agy-text-subtle);
+        color: var(--agy-fg-subtle);
         cursor: pointer;
         -webkit-app-region: no-drag;
         transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
     }
     .tab-add-btn:hover {
-        background: rgba(255, 255, 255, 0.08);
+        background: var(--agy-hover-bg);
         border-color: var(--agy-border);
-        color: var(--agy-text-primary);
+        color: var(--agy-fg);
     }
 </style>
 </head>
@@ -1038,13 +1518,14 @@ function renderPickerHtml(port) {
 </div>
 <script>
 (() => {
-    ${buildSharedThemeScript(baseUrl)}
+    ${buildSharedThemeScript(baseUrl, token)}
 
     let snapshot = { activeId: "", viewMode: "picker", openTabOrder: [], accounts: [] };
     let videosList = [];
     let currentVideoId = "";
     let editingId = null;
     let confirmDelId = null;
+    let deferredAccountsRender = false;
     let busyId = null;
     let isVisible = true;
 
@@ -1061,6 +1542,17 @@ function renderPickerHtml(port) {
     }
 
     function applyWallpaper() {
+        const bgDimEl = typeof document.querySelector === "function" ? document.querySelector(".bg-dim") : null;
+        if (themeState.wallpaperEnabled === false) {
+            currentVideoId = "";
+            try { bgVideo.pause(); bgVideo.removeAttribute("src"); bgVideo.load(); } catch {}
+            try { bgImg.removeAttribute("src"); } catch {}
+            bgVideo.style.display = "none";
+            bgImg.style.display = "none";
+            if (bgDimEl) bgDimEl.style.display = "none";
+            return;
+        }
+        if (bgDimEl) bgDimEl.style.display = "";
         const filters = [];
         if (themeState.videoBlur > 0) filters.push("blur(" + themeState.videoBlur + "px)");
         if (Math.abs(themeState.videoSat - 1) > 0.01) filters.push("saturate(" + themeState.videoSat + ")");
@@ -1071,37 +1563,56 @@ function renderPickerHtml(port) {
         bgImg.style.filter = filterStr;
         bgImg.style.objectFit = themeState.videoFit || "cover";
 
-        if (!videosList.length) return;
-        let item = themeState.currentId ? videosList.find((v) => v.id === themeState.currentId) : null;
-        if (!item) item = videosList[themeState.currentIndex] || videosList[0];
+        const hiddenSet = new Set(Array.isArray(themeState.hiddenIds) ? themeState.hiddenIds : []);
+        const filteredVideos = videosList.filter((v) => {
+            if (!v) return false;
+            if (hiddenSet.has(v.id)) return false;
+            if (themeState.hideMature && v.isMature) return false;
+            if (themeState.hideLowRes && v.isLowRes) return false;
+            if (themeState.mediaFilter === "video" && v.kind !== "video") return false;
+            if (themeState.mediaFilter === "image" && v.kind === "video") return false;
+            return true;
+        });
+
+        if (!filteredVideos.length) {
+            currentVideoId = "";
+            try { bgVideo.pause(); bgVideo.removeAttribute("src"); bgVideo.load(); } catch {}
+            bgVideo.style.display = "none";
+            bgImg.style.display = "none";
+            return;
+        }
+        let item = themeState.currentId ? filteredVideos.find((v) => v.id === themeState.currentId) : null;
+        if (!item) item = filteredVideos[themeState.currentIndex] || filteredVideos[0];
         if (!item) return;
 
+        const allowVideoPlayback = isVisible && !themeState.staticWallpaperMode;
         if (item.id !== currentVideoId) {
             currentVideoId = item.id;
-            const src = BASE_URL + "/stream/" + item.index;
+            const src = withToken(BASE_URL + "/stream/" + item.index);
             if (item.kind === "video") {
                 bgImg.style.display = "none";
                 bgVideo.style.display = "block";
                 bgVideo.src = src;
                 bgVideo.muted = true;
                 bgVideo.playbackRate = themeState.playbackRate || 1.0;
-                if (isVisible) bgVideo.play().catch(() => {});
+                if (allowVideoPlayback) bgVideo.play().catch(() => {});
+                else { try { bgVideo.pause(); } catch {} }
             } else {
-                bgVideo.pause();
+                try { bgVideo.pause(); bgVideo.removeAttribute("src"); bgVideo.load(); } catch {}
                 bgVideo.style.display = "none";
                 bgImg.src = src;
                 bgImg.style.display = "block";
             }
         } else if (item.kind === "video") {
             bgVideo.playbackRate = themeState.playbackRate || 1.0;
-            if (isVisible) bgVideo.play().catch(() => {});
-            else bgVideo.pause();
+            if (allowVideoPlayback) bgVideo.play().catch(() => {});
+            else { try { bgVideo.pause(); } catch {} }
         }
     }
 
     window.addEventListener("agy-tab-visibility", (e) => {
         isVisible = Boolean(e.detail?.visible);
-        if (isVisible) {
+        if (themeState.wallpaperEnabled !== false && isVisible && !themeState.staticWallpaperMode) {
             if (bgVideo.style.display === "block") bgVideo.play().catch(() => {});
         } else {
             try { bgVideo.pause(); } catch {}
@@ -1152,7 +1663,8 @@ function renderPickerHtml(port) {
             '<span>' + esc(freshness) + '</span>';
         box.appendChild(hdr);
 
-        const quotas = Array.isArray(acc.quotas) ? acc.quotas : [];
+        const rawQuotas = Array.isArray(acc.quotas) ? acc.quotas : [];
+        const quotas = typeof normalizeQuotasForTier === "function" ? normalizeQuotasForTier(rawQuotas, acc.tier) : rawQuotas;
         if (quotas.length === 0) {
             const empty = document.createElement("div");
             empty.className = "q-empty";
@@ -1166,9 +1678,11 @@ function renderPickerHtml(port) {
         const localizePoolLabel = (lbl) => {
             if (!ru) return lbl;
             if (lbl === "Gemini Models") return "Модели Gemini";
-            if (lbl === "Claude & GPT") return "Claude и GPT";
+            if (lbl === "Claude & GPT") return "Модели Claude и GPT";
             if (lbl === "Claude Models") return "Модели Claude";
             if (lbl === "GPT Models") return "Модели GPT";
+            if (lbl === "Gemini & Argon" || lbl === "Gemini & Argon Models") return "Модели Gemini и Argon";
+            if (lbl === "Orchestrator") return "Оркестратор";
             return lbl;
         };
 
@@ -1176,8 +1690,8 @@ function renderPickerHtml(port) {
         for (const q of quotas.slice(0, 6)) {
             const pct = q.remainingFraction >= 0 ? Math.round(q.remainingFraction * 100) : null;
             let barColor = "rgb(var(--agy-accent-rgb))";
-            if (pct !== null && pct <= 15) barColor = "#ef4444";
-            else if (pct !== null && pct <= 40) barColor = "#f59e0b";
+            if (pct !== null && pct <= 15) barColor = "var(--agy-danger-fg, #ef4444)";
+            else if (pct !== null && pct <= 40) barColor = "var(--agy-warn-fg, #f59e0b)";
             const resetTxt = q.resetTime && q.resetTime !== "[object Object]" ? formatResetTime(q.resetTime, ru) : "";
 
             const row = document.createElement("div");
@@ -1201,7 +1715,7 @@ function renderPickerHtml(port) {
             ? "Запуск изолированного сервера аккаунта... Обычно это занимает 3–10 секунд, процесс не завис."
             : "Starting isolated account server... This usually takes 3–10 seconds.", false, true);
         render();
-        fetch(BASE_URL + "/tabs/open", {
+        apiFetch("/tabs/open", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id }),
@@ -1264,25 +1778,40 @@ function renderPickerHtml(port) {
                 inp.className = "rename-inp";
                 inp.value = acc.customLabel || acc.displayName || "";
                 inp.placeholder = ru ? "Название..." : "Label...";
-                const commit = () => {
+                let renameDone = false;
+                const cancelRename = () => {
+                    if (renameDone) return;
+                    renameDone = true;
                     editingId = null;
-                    fetch(BASE_URL + "/accounts/rename", {
+                    deferredAccountsRender = false;
+                    render();
+                };
+                const commit = () => {
+                    if (renameDone) return;
+                    renameDone = true;
+                    editingId = null;
+                    deferredAccountsRender = false;
+                    apiFetch("/accounts/rename", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: acc.id, label: inp.value }),
                     }).catch(() => {});
+                    render();
                 };
                 inp.onkeydown = (ev) => {
-                    if (ev.key === "Enter") commit();
-                    if (ev.key === "Escape") { editingId = null; render(); }
+                    if (ev.key === "Enter") { ev.preventDefault(); commit(); }
+                    if (ev.key === "Escape") { ev.preventDefault(); cancelRename(); }
                 };
-                inp.onblur = commit;
+                inp.onblur = () => commit();
                 ident.appendChild(inp);
                 setTimeout(() => inp.focus(), 10);
             } else {
+                const dispTitle = formatPrivacyValue(title, title.includes("@"));
+                const rawEmailLine = acc.email || (isDefault ? (isWin ? (ru ? "Основная сессия Windows" : "Primary Windows session") : (ru ? "Основная сессия" : "Primary session")) : (ru ? "Вход в Google при открытии" : "Sign in to Google on open"));
+                const dispEmailLine = formatPrivacyValue(rawEmailLine, Boolean(acc.email));
                 ident.innerHTML =
-                    '<div class="ident-name">' + esc(title) + '</div>' +
-                    '<div class="ident-email">' + esc(acc.email || (isDefault ? (isWin ? (ru ? "Основная сессия Windows" : "Primary Windows session") : (ru ? "Основная сессия" : "Primary session")) : (ru ? "Вход в Google при открытии" : "Sign in to Google on open"))) + '</div>';
+                    '<div class="ident-name' + (title.includes("@") ? ' is-email' : '') + '">' + esc(dispTitle) + '</div>' +
+                    '<div class="ident-email">' + esc(dispEmailLine) + '</div>';
             }
             top.append(av, ident);
 
@@ -1292,7 +1821,7 @@ function renderPickerHtml(port) {
 
             const stTag = document.createElement("span");
             stTag.className = "tag";
-            stTag.innerHTML = '<span class="st-sq" style="background:' + st.color + ';"></span><span>' + esc(st.label) + '</span>';
+            stTag.innerHTML = '<span class="st-sq ' + esc(st.key) + '" style="background:' + esc(st.color) + ';"></span><span>' + esc(st.label) + '</span>';
 
             const isoTag = document.createElement("span");
             if (isDefault) {
@@ -1335,7 +1864,7 @@ function renderPickerHtml(port) {
                 stopBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>';
                 stopBtn.onclick = (e) => {
                     e.stopPropagation();
-                    fetch(BASE_URL + "/tabs/close", {
+                    apiFetch("/tabs/close", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: acc.id, stopServer: true }),
@@ -1351,7 +1880,7 @@ function renderPickerHtml(port) {
                 folderBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
                 folderBtn.onclick = (e) => {
                     e.stopPropagation();
-                    fetch(BASE_URL + "/accounts/grant-folder", {
+                    apiFetch("/accounts/grant-folder", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: acc.id }),
@@ -1393,7 +1922,7 @@ function renderPickerHtml(port) {
                     showBanner(isWin
                         ? (ru ? "Удаление изолированного профиля Windows (подтвердите UAC)..." : "Removing isolated Windows profile (confirm UAC)...")
                         : (ru ? "Удаление изолированного профиля и данных..." : "Removing isolated profile and data..."));
-                    fetch(BASE_URL + "/accounts/delete", {
+                    apiFetch("/accounts/delete", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: acc.id, purgeData: true }),
@@ -1410,8 +1939,8 @@ function renderPickerHtml(port) {
 
             if (acc.lastError) {
                 const errEl = document.createElement("div");
-                errEl.style.cssText = "font-size:0.78em;color:#fca5a5;line-height:1.35;";
-                errEl.textContent = acc.lastError;
+                errEl.style.cssText = "font-size:0.78em;color:var(--agy-danger-fg, #fca5a5);line-height:1.35;";
+                errEl.textContent = themeState.privacyMode ? maskSensitiveString(acc.lastError, themeState.privacyHidePaths) : acc.lastError;
                 card.appendChild(errEl);
             }
             grid.appendChild(card);
@@ -1442,7 +1971,7 @@ function renderPickerHtml(port) {
                     : "Configuring permissions and launching account server... Still working, tab will open automatically.", false, true);
             }
         }, 5500);
-        fetch(BASE_URL + "/accounts/add", {
+        apiFetch("/accounts/add", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ label, openInNewWindow: false }),
@@ -1466,26 +1995,29 @@ function renderPickerHtml(port) {
         const next = themeState.lang === "en" ? "ru" : "en";
         themeState.lang = next;
         render();
-        fetch(BASE_URL + "/extras/config")
-            .then((r) => r.json())
-            .catch(() => ({}))
-            .then((cur) => {
-                return fetch(BASE_URL + "/extras/config", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ ...(cur || {}), lang: next }),
-                });
-            })
-            .catch(() => {});
+        Promise.all([
+            apiFetch("/extras/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ lang: next }),
+            }),
+            apiFetch("/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ lang: next }),
+            }),
+        ]).catch(() => {});
     };
 
     function refreshAll() {
         Promise.all([
-            fetch(BASE_URL + "/config").then((r) => r.json()).catch(() => ({})),
-            fetch(BASE_URL + "/extras/config").then((r) => r.json()).catch(() => ({})),
-            fetch(BASE_URL + "/list").then((r) => r.json()).catch(() => ({ videos: [] })),
-            fetch(BASE_URL + "/accounts/list").then((r) => r.json()).catch(() => null),
-        ]).then(([cfg, ex, listData, accRes]) => {
+            apiFetch("/config").then((r) => r.json()).catch(() => ({})),
+            apiFetch("/extras/config").then((r) => r.json()).catch(() => ({})),
+            apiFetch("/list").then((r) => r.json()).catch(() => ({ videos: [] })),
+            apiFetch("/accounts/list").then((r) => r.json()).catch(() => null),
+            apiFetch("/fonts/list").then((r) => r.json()).catch(() => ({ fonts: [] })),
+        ]).then(([cfg, ex, listData, accRes, fontRes]) => {
+            if (fontRes && Array.isArray(fontRes.fonts)) registerShellCustomFonts(fontRes.fonts);
             hydrateTheme(cfg, ex);
             applySharedThemeVars();
             videosList = Array.isArray(listData?.videos) ? listData.videos : [];
@@ -1496,7 +2028,7 @@ function renderPickerHtml(port) {
     }
 
     refreshAll();
-    setInterval(() => { if (isVisible) render(); }, 30000);
+    setInterval(() => { if (!document.hidden) { if (isVisible && !editingId && !confirmDelId) render(); } }, 30000);
 
     // Custom tooltips in Picker view (replaces native OS title popups)
     (() => {
@@ -1507,10 +2039,10 @@ function renderPickerHtml(port) {
             "opacity:0", "transition:opacity 0.12s ease", "visibility:hidden",
             "padding:5px 9px", "max-width:min(320px,85vw)", "line-height:1.35",
             "border-radius:var(--agy-radius-sm,7px)",
-            "background:rgba(var(--agy-tint-rgb,14,17,24),var(--agy-surface-modal-alpha,0.90))",
-            "border:1px solid rgba(255,255,255,0.13)",
-            "box-shadow:0 10px 28px rgba(0,0,0,0.52)",
-            "color:var(--text,#f1f5f9)",
+            "background:var(--agy-surface-popover,rgba(var(--agy-tint-rgb,14,17,24),var(--agy-surface-modal-alpha,0.92)))",
+            "border:1px solid var(--agy-border-strong,rgba(255,255,255,0.22))",
+            "box-shadow:var(--agy-shadow-panel,0 10px 28px rgba(0,0,0,0.42))",
+            "color:var(--agy-text-primary,#f1f5f9)",
             "font-family:var(--agy-ui-font,'Segoe UI Variable','Segoe UI',system-ui,sans-serif)",
             "font-size:calc(var(--agy-base-font-size,14px) * 0.84)",
             "font-weight:500", "white-space:normal", "word-break:break-word",
@@ -1573,33 +2105,48 @@ function renderPickerHtml(port) {
     })();
 
     try {
-        const es = new EventSource(BASE_URL + "/events");
+        const es = new EventSource(withToken(BASE_URL + "/events"));
+        es.addEventListener("fonts", (ev) => {
+            try {
+                const payload = JSON.parse(ev.data);
+                if (payload && Array.isArray(payload.fonts)) registerShellCustomFonts(payload.fonts);
+            } catch {}
+        });
         es.addEventListener("accounts", (ev) => {
             try {
                 const data = JSON.parse(ev.data);
                 if (data && Array.isArray(data.accounts)) {
                     snapshot = data;
-                    render();
+                    if (editingId || confirmDelId) {
+                        deferredAccountsRender = true;
+                    } else {
+                        deferredAccountsRender = false;
+                        render();
+                    }
                 }
             } catch {}
         });
         es.addEventListener("config", (ev) => {
             try {
                 const cfg = JSON.parse(ev.data);
+                const prevSig = [themeState.lang, themeState.privacyMode, themeState.privacyHideStyle, themeState.privacyRevealMode, themeState.privacyHidePaths].join("|");
                 hydrateTheme(cfg, null);
                 applySharedThemeVars();
                 applyWallpaper();
-                render();
+                const nextSig = [themeState.lang, themeState.privacyMode, themeState.privacyHideStyle, themeState.privacyRevealMode, themeState.privacyHidePaths].join("|");
+                if (nextSig !== prevSig && !editingId && !confirmDelId) render();
             } catch {}
         });
         es.addEventListener("extras", (ev) => {
             try {
                 const ex = JSON.parse(ev.data);
+                const prevLang = themeState.lang;
                 hydrateTheme(null, ex);
                 applySharedThemeVars();
-                render();
+                if (themeState.lang !== prevLang) render();
             } catch {}
         });
+        window.addEventListener("pagehide", () => { try { es.close(); } catch {} });
     } catch {}
 })();
 </script>

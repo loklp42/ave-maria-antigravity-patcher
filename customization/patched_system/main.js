@@ -41,6 +41,7 @@ const main_1 = __importDefault(require("electron-log/main"));
 const ipcHandlers_1 = require("./ipcHandlers");
 const cablev2_1 = require("./cablev2");
 const wcvBrowserRegistry_1 = require("./wcvBrowserRegistry");
+const wcvIpcHandlers_1 = require("./wcvIpcHandlers");
 const fs = __importStar(require("fs"));
 const crypto = __importStar(require("crypto"));
 const readline = __importStar(require("readline"));
@@ -81,6 +82,10 @@ const previewIpc_1 = require("./computer/previewIpc");
 const captureWindow_1 = require("./browserStream/captureWindow");
 const browserViewerHandler_1 = require("./browserStream/browserViewerHandler");
 const agyTabManager = require("./agyTabManager");
+let agyAccounts = null;
+let wallpaperEngine = null;
+try { agyAccounts = require("./agyAccounts"); } catch {}
+try { wallpaperEngine = require("./wallpaperEngine"); } catch {}
 // Isolate Electron userData ONLY when explicitly launched with --agy-profile=<id> for a separate parallel window
 const _agyCliProfile = (electron_1.app?.commandLine?.getSwitchValue?.('agy-profile') || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
 if (_agyCliProfile && _agyCliProfile !== 'default') {
@@ -228,16 +233,28 @@ function handleDeepLink(url) {
         mw.show();
         mw.focus();
         electron_1.app.focus({ steal: true });
-        const activeId = agyTabManager.getActiveAccountId();
-        const activeWc = activeId ? agyTabManager.getTabWebContents(activeId) : null;
+        const isOAuth = (0, signInReturn_1.isOAuthSuccessLink)(url, PROTOCOL);
+        const oauthMatch = isOAuth
+            ? (agyTabManager.peekOAuthInitiator?.(5 * 60 * 1000, Date.now(), url) || null)
+            : null;
+        const targetId = oauthMatch?.accountId || agyTabManager.getActiveAccountId() || 'default';
+        const activeWc = targetId ? agyTabManager.getTabWebContents(targetId) : null;
         if (activeWc && !activeWc.isDestroyed?.() && activeWc.getURL() && !activeWc.isLoadingMainFrame?.()) {
+            if (targetId && targetId !== agyTabManager.getActiveAccountId()) {
+                agyTabManager.activateTabView(targetId);
+            }
             activeWc.send('deep-link', url);
+            if (oauthMatch?.tokenId) {
+                agyTabManager.consumeOAuthInitiator?.(5 * 60 * 1000, Date.now(), url, oauthMatch.tokenId);
+            }
         }
         else {
-            pendingDeepLink = url;
-            if (!activeId) {
-                void agyTabManager.openOrActivateAccount('default');
-            }
+            pendingDeepLink = {
+                url,
+                accountId: targetId || 'default',
+                oauthTokenId: oauthMatch?.tokenId || '',
+            };
+            void agyTabManager.openOrActivateAccount(targetId || 'default');
         }
         return;
     }
@@ -418,11 +435,47 @@ electron_1.app
     // SSH windows hear only this store's app settings (hosts have their own).
     storageManager = new storage_1.StorageManager(storagePath, settingsService_1.DEFAULTS, hostStores_1.mainStoreScope);
     settingsService = new settingsService_1.SettingsService(storageManager);
+    const resolveColdStartDeepLinkAccountId = () => {
+        if (HEADLESS || DEV_URL) {
+            return '';
+        }
+        if (_agyCliProfile) {
+            return _agyCliProfile;
+        }
+        try {
+            if (!wallpaperEngine) {
+                try { wallpaperEngine = require('./wallpaperEngine'); } catch {}
+            }
+            if (!agyAccounts) {
+                try { agyAccounts = require('./agyAccounts'); } catch {}
+            }
+            const wpCfg = wallpaperEngine && typeof wallpaperEngine.readAppearanceConfig === 'function'
+                ? wallpaperEngine.readAppearanceConfig()
+                : {};
+            const startupMode = wpCfg.accountStartupMode || 'picker';
+            const accounts = agyAccounts && typeof agyAccounts.loadAccounts === 'function'
+                ? agyAccounts.loadAccounts()
+                : [];
+            if (startupMode === 'primary') {
+                const primaryId = String(wpCfg.primaryAccountId || 'default').trim().toLowerCase();
+                const target = accounts.find((a) => a.id === primaryId) || accounts.find((a) => a.id === 'default') || accounts[0];
+                if (target?.id) return target.id;
+            }
+            else if (startupMode === 'last' && accounts.length > 0) {
+                const sorted = [...accounts].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
+                if (sorted[0]?.id) return sorted[0].id;
+            }
+        } catch {}
+        return 'default';
+    };
     // Handle deep link URL from command line arguments (All platforms)
     const deepLinkFromArg = process.argv.find((arg) => arg.startsWith(`${PROTOCOL}://`));
     if (deepLinkFromArg) {
         console.log('Launched with deep link:', (0, authBootstrap_1.redactUrlTokens)(deepLinkFromArg));
-        pendingDeepLink = deepLinkFromArg;
+        pendingDeepLink = {
+            url: deepLinkFromArg,
+            accountId: resolveColdStartDeepLinkAccountId(),
+        };
     }
     if (!HEADLESS) {
         sshWindows = new sshWindowRestore_1.SshWindowRestore(path.join(electron_1.app.getPath('userData'), sshWindowRestore_1.SSH_WINDOWS_FILE));
@@ -461,6 +514,25 @@ electron_1.app
     electron_1.ipcMain.handle('deep-link:get-stored', (event) => {
         if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
             return null; // Deep links are for local windows only.
+        }
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            return null;
+        }
+        if (!pendingDeepLink) {
+            return null;
+        }
+        if (typeof pendingDeepLink === 'object' && pendingDeepLink.url) {
+            const senderAccId = agyTabManager.getAccountIdForWebContents?.(event?.sender) || '';
+            if (pendingDeepLink.accountId && (!senderAccId || senderAccId !== pendingDeepLink.accountId)) {
+                return null;
+            }
+            const link = pendingDeepLink.url;
+            const oauthTokenId = pendingDeepLink.oauthTokenId;
+            pendingDeepLink = null;
+            if (oauthTokenId) {
+                agyTabManager.consumeOAuthInitiator?.(5 * 60 * 1000, Date.now(), link, oauthTokenId);
+            }
+            return link;
         }
         const link = pendingDeepLink;
         pendingDeepLink = null; // Clear after read
@@ -635,16 +707,14 @@ electron_1.app
             },
         });
         agyTabManager.setActiveLsChangedCallback((_accId, port, activeCsrf) => {
-            if (!mendelFlagSync) {
-                mendelFlagSync = (0, mendelFlagSync_1.startMendelFlagSync)({
+            mendelFlagSync?.dispose?.();
+            mendelFlagSync = port > 0 && activeCsrf
+                ? (0, mendelFlagSync_1.startMendelFlagSync)({
                     port,
                     csrfToken: activeCsrf,
                     storageManager,
-                });
-            }
-            else {
-                mendelFlagSync.onPortChanged(port);
-            }
+                })
+                : null;
             if (browserViewerRegistered) {
                 (0, browserViewerHandler_1.syncBrowserViewerHostPresence)();
             }
@@ -655,31 +725,42 @@ electron_1.app
         console.log(`  Electron Logs: ${main_1.default.transports.file.getFile().path}`);
         console.log('='.repeat(60) + '\n');
         (0, menu_1.setupApplicationMenu)(`${constants_1.WINDOW_ORIGIN}:0/`);
-        await agyTabManager.createMainTabWindow(storageManager);
+        let initialAccountId = null;
         if (_agyCliProfile) {
-            void agyTabManager.openOrActivateAccount(_agyCliProfile);
+            initialAccountId = _agyCliProfile;
         }
         else if (pendingDeepLink) {
-            void agyTabManager.openOrActivateAccount('default');
+            initialAccountId = (typeof pendingDeepLink === 'object' && pendingDeepLink.accountId) ? pendingDeepLink.accountId : 'default';
         }
         else {
             try {
-                const wpCfg = typeof wallpaperEngine.readAppearanceConfig === 'function'
+                if (!wallpaperEngine) {
+                    try { wallpaperEngine = require('./wallpaperEngine'); } catch {}
+                }
+                if (!agyAccounts) {
+                    try { agyAccounts = require('./agyAccounts'); } catch {}
+                }
+                const wpCfg = wallpaperEngine && typeof wallpaperEngine.readAppearanceConfig === 'function'
                     ? wallpaperEngine.readAppearanceConfig()
                     : {};
                 const startupMode = wpCfg.accountStartupMode || 'picker';
-                const accounts = typeof agyAccounts.loadAccounts === 'function'
+                const accounts = agyAccounts && typeof agyAccounts.loadAccounts === 'function'
                     ? agyAccounts.loadAccounts()
                     : [];
-                if (startupMode === 'primary' && wpCfg.primaryAccountId) {
-                    const target = accounts.find((a) => a.id === wpCfg.primaryAccountId);
-                    if (target) void agyTabManager.openOrActivateAccount(target.id);
+                if (startupMode === 'primary') {
+                    const primaryId = String(wpCfg.primaryAccountId || 'default').trim().toLowerCase();
+                    const target = accounts.find((a) => a.id === primaryId) || accounts.find((a) => a.id === 'default') || accounts[0];
+                    if (target) initialAccountId = target.id;
                 }
                 else if (startupMode === 'last' && accounts.length > 0) {
                     const sorted = [...accounts].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
-                    if (sorted[0]?.id) void agyTabManager.openOrActivateAccount(sorted[0].id);
+                    if (sorted[0]?.id) initialAccountId = sorted[0].id;
                 }
             } catch {}
+        }
+        await agyTabManager.createMainTabWindow(storageManager, { initialAccountId });
+        if (initialAccountId) {
+            void agyTabManager.openOrActivateAccount(initialAccountId);
         }
         if (electron_1.app.dock) {
             const dockMenu = electron_1.Menu.buildFromTemplate([
@@ -874,8 +955,9 @@ electron_1.app.on('before-quit', async (event) => {
             console.error('Failed to close SSH connections:', err);
         }) ?? Promise.resolve();
         // Cleanly detach and close all WebContentsView tabs/shell views before BaseWindow.destroy()
+        let closeViewsPromise = Promise.resolve();
         try {
-            agyTabManager.closeAllViewsForQuit?.();
+            closeViewsPromise = Promise.resolve(agyTabManager.closeAllViewsForQuit?.()).catch(() => {});
         } catch {}
         // Destroy all windows to terminate renderers and release keep-alive sockets
         const windows = [
@@ -912,6 +994,7 @@ electron_1.app.on('before-quit', async (event) => {
         ]);
         // Close all active connections and kill the language server in parallel
         await Promise.all([
+            Promise.race([closeViewsPromise, new Promise((resolve) => setTimeout(resolve, 1500))]),
             electron_1.session.defaultSession.closeAllConnections().catch((err) => {
                 console.error('Failed to close session connections:', err);
             }),

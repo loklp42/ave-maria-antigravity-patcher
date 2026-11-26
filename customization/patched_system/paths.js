@@ -89,7 +89,7 @@ function setActiveProfileName(profileId, persist = true) {
         try {
             const fp = getActiveProfileFilePath();
             if (fp) {
-                fs.writeFileSync(fp, JSON.stringify({ activeProfile: clean || 'default' }, null, 2), 'utf8');
+                fs.writeFileSync(fp, JSON.stringify({ activeProfile: clean || 'default' }, null, 2), { encoding: 'utf8', mode: 0o600 });
             }
         }
         catch {
@@ -154,16 +154,33 @@ function getSharedConfigDir() {
         return electron_1.app?.getPath?.('userData') || path_1.default.join(getFallbackAppDataDir(), 'Antigravity');
     }
 }
+function isSubpathWithin(parentDir, candidatePath) {
+    const resolvedParent = path_1.default.resolve(parentDir);
+    const resolvedCandidate = path_1.default.resolve(candidatePath);
+    const normParent = process.platform === 'win32' ? resolvedParent.toLowerCase() : resolvedParent;
+    const normCandidate = process.platform === 'win32' ? resolvedCandidate.toLowerCase() : resolvedCandidate;
+    const rel = path_1.default.relative(normParent, normCandidate);
+    return rel === '' || (!rel.startsWith('..') && !path_1.default.isAbsolute(rel));
+}
 function getGeminiDirForProfile(profileId, explicitDir) {
-    if (typeof explicitDir === 'string' && explicitDir.trim()) {
-        return explicitDir.trim();
-    }
     const profile = normalizeProfilePathId(profileId);
     if (profile === null) {
         return '';
     }
     if (!profile) {
         return path_1.default.join(os_1.default.homedir(), '.gemini');
+    }
+    if (typeof explicitDir === 'string' && explicitDir.trim()) {
+        const candidate = path_1.default.resolve(explicitDir.trim());
+        const allowedRoots = [
+            path_1.default.join(os_1.default.homedir(), '.gemini-profiles', profile),
+        ];
+        if (process.platform === 'win32') {
+            allowedRoots.push(path_1.default.join('C:\\ProgramData\\AntigravityAccounts', profile));
+        }
+        if (allowedRoots.some((root) => isSubpathWithin(root, candidate))) {
+            return candidate;
+        }
     }
     if (process.platform === 'win32') {
         const isolated = path_1.default.join('C:\\ProgramData\\AntigravityAccounts', profile, '.gemini');

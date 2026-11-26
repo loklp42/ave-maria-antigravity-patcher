@@ -1,6 +1,12 @@
 --- a/dist/customScheme.js
 +++ b/dist/customScheme.js
-@@ -4,9 +4,11 @@
+@@ -1,18 +1,67 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.extensionAuthorities = exports.BROWSER_STREAM_SCHEME = void 0;
++exports.isAllowedSidecarAuthorityUrl = isAllowedSidecarAuthorityUrl;
++exports.getExtensionAuthoritiesForSession = getExtensionAuthoritiesForSession;
++exports.setExtensionAuthoritiesForSession = setExtensionAuthoritiesForSession;
  exports.registerCustomSchemes = registerCustomSchemes;
  exports.handleFaviconProtocolRequest = handleFaviconProtocolRequest;
  exports.registerCustomSchemeHandlers = registerCustomSchemeHandlers;
@@ -12,7 +18,57 @@
  exports.BROWSER_STREAM_SCHEME = 'agy-browser-stream';
  // A map of extension authority -> original URL (http://localhost:<port>)
  // The authority is usually a hash of unique extension identifiers
-@@ -39,6 +41,7 @@
+ // like extension ID + port + project ID. An extension running on localhost:<port>
+ // is then exposed on plugin://<authority>.
++// Default session keeps `exports.extensionAuthorities`; isolated profile partitions
++// each receive their own Map inside `sessionExtensionAuthorities` to prevent cross-profile
++// overwriting or SSRF via arbitrary external authority URLs.
+ exports.extensionAuthorities = new Map();
++const sessionExtensionAuthorities = new WeakMap();
++function isAllowedSidecarAuthorityUrl(rawUrl) {
++    if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
++        return false;
++    }
++    try {
++        const u = new URL(rawUrl.trim());
++        if (u.protocol !== 'http:' && u.protocol !== 'https:') {
++            return false;
++        }
++        const host = u.hostname.toLowerCase();
++        return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
++    }
++    catch {
++        return false;
++    }
++}
++function getExtensionAuthoritiesForSession(targetSession) {
++    const defaultSes = electron_1.session?.defaultSession;
++    if (!targetSession || (defaultSes && targetSession === defaultSes)) {
++        return exports.extensionAuthorities;
++    }
++    let map = sessionExtensionAuthorities.get(targetSession);
++    if (!map) {
++        map = new Map();
++        sessionExtensionAuthorities.set(targetSession, map);
++    }
++    return map;
++}
++function setExtensionAuthoritiesForSession(targetSession, authorities) {
++    const map = getExtensionAuthoritiesForSession(targetSession);
++    map.clear();
++    if (!authorities || typeof authorities !== 'object') {
++        return;
++    }
++    for (const [key, value] of Object.entries(authorities)) {
++        if (typeof key === 'string' && key && isAllowedSidecarAuthorityUrl(value)) {
++            map.set(key, String(value).trim());
++        }
++    }
++}
+ function registerCustomSchemes() {
+     electron_1.protocol.registerSchemesAsPrivileged([
+         {
+@@ -39,6 +88,7 @@
              privileges: { standard: true, secure: true },
          },
      ]);
@@ -20,21 +76,34 @@
  }
  /**
   * Handles `agy-favicon://<token>/` by looking the token up in the favicon
-@@ -70,34 +73,55 @@
+@@ -70,34 +120,71 @@
          },
      });
  }
-+async function handlePluginProtocolRequest(request) {
-+    const url = new URL(request.url);
++async function handlePluginProtocolRequestForSession(targetSession, request) {
++    let url;
++    try {
++        url = new URL(request.url);
++    }
++    catch {
++        return new Response(null, { status: 400 });
++    }
 +    const authority = url.hostname;
-+    const originalHost = exports.extensionAuthorities.get(authority);
-+    if (!originalHost) {
++    const originalHost = getExtensionAuthoritiesForSession(targetSession).get(authority);
++    if (!originalHost || !isAllowedSidecarAuthorityUrl(originalHost)) {
 +        return new Response(null, { status: 404 });
 +    }
 +    // Origin plus path: resolving a path like "//host/x" against the sidecar
 +    // URL would switch to another host.
-+    const sidecar = new URL(originalHost);
-+    const targetUrl = new URL(`${sidecar.origin}${url.pathname}${url.search}`);
++    let sidecar;
++    let targetUrl;
++    try {
++        sidecar = new URL(originalHost);
++        targetUrl = new URL(`${sidecar.origin}${url.pathname}${url.search}`);
++    }
++    catch {
++        return new Response(null, { status: 400 });
++    }
 +    if (targetUrl.host !== sidecar.host) {
 +        return new Response(null, { status: 404 });
 +    }
@@ -49,6 +118,9 @@
 +        return new Response(null, { status: 500 });
 +    }
 +}
++async function handlePluginProtocolRequest(request) {
++    return handlePluginProtocolRequestForSession(electron_1.session?.defaultSession, request);
++}
 +const registeredSchemeSessions = new WeakSet();
 +function registerCustomSchemeHandlersForSession(targetSession) {
 +    if (!targetSession || registeredSchemeSessions.has(targetSession)) {
@@ -57,7 +129,7 @@
 +    registeredSchemeSessions.add(targetSession);
 +    try {
 +        if (!targetSession.protocol.isProtocolHandled('plugin')) {
-+            targetSession.protocol.handle('plugin', handlePluginProtocolRequest);
++            targetSession.protocol.handle('plugin', (request) => handlePluginProtocolRequestForSession(targetSession, request));
 +        }
 +    }
 +    catch {}

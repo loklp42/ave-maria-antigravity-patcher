@@ -33,6 +33,13 @@ def _is_patcher_text(text: str) -> bool:
     return any(h in low for h in PATCHER_HINTS)
 
 
+def _extract_argv0(cmdline_bytes: bytes) -> str:
+    if not cmdline_bytes:
+        return ""
+    argv0 = cmdline_bytes.split(b"\x00", 1)[0]
+    return argv0.decode("utf-8", errors="replace")
+
+
 def get_running_antigravity_pids() -> List[Tuple[int, str]]:
     """Returns list of (PID, ProcessName) for active Antigravity components."""
     found: List[Tuple[int, str]] = []
@@ -71,10 +78,10 @@ def get_running_antigravity_pids() -> List[Tuple[int, str]]:
             proc_dir = os.path.join("/proc", entry)
             try:
                 with open(os.path.join(proc_dir, "cmdline"), "rb") as f:
-                    cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                    argv0 = _extract_argv0(f.read())
             except OSError:
-                cmdline = ""
-            if _is_patcher_text(cmdline):
+                argv0 = ""
+            if _is_patcher_text(argv0):
                 continue
 
             matched = None
@@ -82,7 +89,9 @@ def get_running_antigravity_pids() -> List[Tuple[int, str]]:
                 exe_path = os.readlink(os.path.join(proc_dir, "exe"))
                 if _is_patcher_text(exe_path):
                     continue
-                base = os.path.basename(exe_path).replace(" (deleted)", "")
+                base = os.path.basename(exe_path)
+                if base.endswith(" (deleted)"):
+                    base = base[:-10]
                 if base.lower() in LINUX_TARGETS:
                     matched = base
             except OSError:
@@ -110,22 +119,24 @@ def terminate_antigravity_processes(timeout_sec: float = 4.0) -> bool:
         return True
 
     if sys.platform == "win32":
-        for pid, _ in pids:
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            except Exception:
-                pass
         start = time.time()
-        while time.time() - start < timeout_sec:
-            if not get_running_antigravity_pids():
+        while True:
+            current = get_running_antigravity_pids()
+            if not current:
                 return True
+            for pid, _ in current:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+            if time.time() - start >= timeout_sec:
+                return len(get_running_antigravity_pids()) == 0
             time.sleep(0.2)
-        return len(get_running_antigravity_pids()) == 0
 
     if sys.platform.startswith("linux"):
         for pid, _ in pids:
@@ -170,6 +181,30 @@ def wait_for_file_unlock(filepath: str, max_retries: int = 15, delay_sec: float 
             return True
 
     for _ in range(max_retries):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                GENERIC_READ = 0x80000000
+                GENERIC_WRITE = 0x40000000
+                OPEN_EXISTING = 3
+                INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+                handle = ctypes.windll.kernel32.CreateFileW(
+                    filepath,
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,  # Exclusive access (share_mode = 0)
+                    None,
+                    OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                if handle != INVALID_HANDLE_VALUE and handle != 0:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return True
+            except Exception:
+                pass
+            time.sleep(delay_sec)
+            continue
+
         try:
             with open(filepath, "r+b"):
                 return True

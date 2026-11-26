@@ -14,9 +14,11 @@ build/
 *.asar.orig
 *.lnk
 
-# User custom wallpapers (keep README placeholder only)
+# User custom wallpapers & fonts (keep README placeholder only)
 custom_wallpapers/*
 !custom_wallpapers/README.txt
+custom_fonts/*
+release_pkg/
 
 # Dependencies & caches
 node_modules/
@@ -36,5 +38,11 @@ Desktop.ini
 npm-debug.log*
 yarn-debug.log*
 
-# Local roadmap & personal planning
+# Internal development notes & private docs
+docs/разработка/
 ROADMAP.md
+AGENTS.md
+AGENTS
+
+
+

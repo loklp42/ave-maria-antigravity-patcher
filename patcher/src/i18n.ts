@@ -5,6 +5,7 @@ export const STRINGS = {
   ru: {
     patched: "Установлен",
     original: "Оригинал",
+    corrupted: "Повреждён",
     notFound: "Не найден",
     browse: "Выбрать",
     folder: "Папка",
@@ -78,6 +79,7 @@ export const STRINGS = {
   en: {
     patched: "Installed",
     original: "Original",
+    corrupted: "Corrupted",
     notFound: "Not found",
     browse: "Browse",
     folder: "Folder",

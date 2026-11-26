@@ -8,10 +8,154 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BLOCK_SIZE: usize = 4 * 1024 * 1024; // 4 MB Electron integrity block size
+const MAX_HEADER_JSON_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB anti-OOM ceiling
+const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB single-entry ceiling
+
+struct TmpFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn unique_tmp_path(target: &Path, suffix: &str) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let fname = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{fname}.{}.{nanos}.{suffix}", std::process::id()))
+}
+
+fn is_retryable_replace_error(err: &std::io::Error) -> bool {
+    if err.kind() == ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(code) = err.raw_os_error() {
+            // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33)
+            return matches!(code, 5 | 32 | 33);
+        }
+    }
+    false
+}
+
+/// Atomically replaces `dst` with `src` (same filesystem) with exponential backoff
+/// against transient Windows AV / Explorer sharing violations (OS error 5 / 32 / 33).
+pub fn atomic_replace_with_retry(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut delay_ms: u64 = 50;
+    let max_attempts = 10;
+    let mut last_err = None;
+    for attempt in 1..=max_attempts {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < max_attempts && is_retryable_replace_error(&e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(400);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Ошибка атомарной замены {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Не удалось заменить {} после {max_attempts} попыток: {}",
+        dst.display(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "неизвестная ошибка".to_string())
+    ))
+}
+
+/// Atomically copies `src` to `dst` via sibling `.tmp` + `sync_all()` + `atomic_replace_with_retry`.
+pub fn atomic_copy_file(src: &Path, dst: &Path) -> Result<(), String> {
+    let tmp_path = unique_tmp_path(dst, "copy.tmp");
+    let mut guard = TmpFileGuard::new(tmp_path.clone());
+    {
+        let mut reader = File::open(src)
+            .map_err(|e| format!("Не удалось открыть исходный файл {}: {e}", src.display()))?;
+        let mut writer = File::create(&tmp_path)
+            .map_err(|e| format!("Не удалось создать временный файл {}: {e}", tmp_path.display()))?;
+        std::io::copy(&mut reader, &mut writer)
+            .map_err(|e| format!("Ошибка копирования {}: {e}", src.display()))?;
+        writer
+            .sync_all()
+            .map_err(|e| format!("Ошибка sync_all при копировании: {e}"))?;
+    }
+    atomic_replace_with_retry(&tmp_path, dst)?;
+    guard.disarm();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dst, fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
+}
+
+/// Atomically writes `data` to `dst` via sibling `.tmp` + `sync_all()` + `atomic_replace_with_retry`.
+pub fn atomic_write_bytes(dst: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Не удалось создать каталог {}: {e}", parent.display()))?;
+        }
+    }
+    let tmp_path = unique_tmp_path(dst, "write.tmp");
+    let mut guard = TmpFileGuard::new(tmp_path.clone());
+    {
+        let mut file = File::create(&tmp_path)
+            .map_err(|e| format!("Не удалось создать временный файл {}: {e}", tmp_path.display()))?;
+        file.write_all(data)
+            .map_err(|e| format!("Ошибка записи {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("Ошибка sync_all {}: {e}", tmp_path.display()))?;
+    }
+    atomic_replace_with_retry(&tmp_path, dst)?;
+    guard.disarm();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dst, fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
+}
+
+fn validate_entry_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(format!("Недопустимое имя узла ASAR: {name:?}"));
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub enum AsarEntry {
@@ -33,12 +177,17 @@ pub struct AsarArchive {
     path: PathBuf,
     header: Value,
     base_offset: u64,
+    file_len: u64,
 }
 
 impl AsarArchive {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         let mut f = File::open(&path).map_err(|e| format!("Не удалось открыть ASAR: {e}"))?;
+        let file_len = f
+            .metadata()
+            .map_err(|e| format!("Ошибка stat ASAR: {e}"))?
+            .len();
 
         let mut hdr = [0u8; 16];
         f.read_exact(&mut hdr)
@@ -53,18 +202,98 @@ impl AsarArchive {
             return Err(format!("Неподдерживаемая сигнатура ASAR: {u1}"));
         }
 
-        let mut json_buf = vec![0u8; json_len as usize];
+        let base_offset = 8u64
+            .checked_add(total_size as u64)
+            .ok_or_else(|| "Переполнение размера заголовка ASAR".to_string())?;
+        if (json_len as u64) > MAX_HEADER_JSON_BYTES
+            || (total_size as u64) < (json_len as u64).saturating_add(8)
+            || base_offset > file_len
+        {
+            return Err(format!(
+                "Повреждённый заголовок ASAR (json_len={json_len}, total_size={total_size}, file_len={file_len})"
+            ));
+        }
+
+        let alloc_len = usize::try_from(json_len)
+            .map_err(|_| "Размер JSON-заголовка ASAR превышает usize".to_string())?;
+        let mut json_buf = vec![0u8; alloc_len];
         f.read_exact(&mut json_buf)
             .map_err(|e| format!("Ошибка чтения JSON-заголовка ASAR: {e}"))?;
 
         let header: Value = serde_json::from_slice(&json_buf)
             .map_err(|e| format!("Ошибка парсинга JSON-заголовка ASAR: {e}"))?;
+        if header.get("files").and_then(|v| v.as_object()).is_none() {
+            return Err("Некорректный заголовок ASAR: отсутствует корневой объект files".to_string());
+        }
 
         Ok(Self {
             path,
             header,
-            base_offset: 8 + total_size as u64,
+            base_offset,
+            file_len,
         })
+    }
+
+    /// Walks header metadata without loading payloads to verify every packed entry
+    /// lies within `[base_offset, file_len]` and all node names are safe.
+    pub fn verify_structural_bounds(&self) -> Result<(), String> {
+        let Some(files) = self.header.get("files").and_then(|v| v.as_object()) else {
+            return Err("Некорректный заголовок ASAR: отсутствует корневой объект files".to_string());
+        };
+        self.verify_files_map_bounds(files, "")
+    }
+
+    fn verify_files_map_bounds(
+        &self,
+        files: &Map<String, Value>,
+        prefix: &str,
+    ) -> Result<(), String> {
+        for (name, item) in files {
+            validate_entry_name(name)?;
+            let full_path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Some(item_obj) = item.as_object() else {
+                return Err(format!("Некорректный узел ASAR для {full_path}"));
+            };
+            if let Some(sub_files_val) = item_obj.get("files") {
+                let Some(sub_files) = sub_files_val.as_object() else {
+                    return Err(format!("Некорректный каталог ASAR для {full_path}"));
+                };
+                self.verify_files_map_bounds(sub_files, &full_path)?;
+            } else if let Some(link_val) = item_obj.get("link") {
+                if !link_val.is_string() {
+                    return Err(format!("Некорректный symlink link для {full_path}"));
+                }
+            } else if item_obj
+                .get("unpacked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                if let Some(sz) = item_obj.get("size") {
+                    let _ = parse_size(Some(sz), &full_path)?;
+                }
+            } else {
+                let size = parse_size(item_obj.get("size"), &full_path)?;
+                let offset = parse_offset_for_entry(item_obj.get("offset"), &full_path, size > 0)?;
+                let start = self
+                    .base_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| format!("Переполнение offset для {full_path}"))?;
+                let end = start
+                    .checked_add(size)
+                    .ok_or_else(|| format!("Переполнение size для {full_path}"))?;
+                if size > MAX_ENTRY_BYTES || end > self.file_len {
+                    return Err(format!(
+                        "Усечённый или повреждённый ASAR: запись {full_path} выходит за пределы файла ({end} > {})",
+                        self.file_len
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lookup_node(&self, rel_path: &str) -> Option<&Value> {
@@ -85,18 +314,35 @@ impl AsarArchive {
         let Some(node) = self.lookup_node(rel_path) else {
             return Ok(None);
         };
-        if node.get("unpacked").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if node.get("unpacked").and_then(|v| v.as_bool()).unwrap_or(false)
+            || node.get("files").is_some()
+            || node.get("link").is_some()
+        {
             return Ok(None);
         }
-        let Some(size) = node.get("size").and_then(|v| v.as_u64()) else {
-            return Ok(None);
-        };
-        let offset = parse_offset(node.get("offset"))?;
+        let size = parse_size(node.get("size"), rel_path)?;
+        let offset = parse_offset_for_entry(node.get("offset"), rel_path, size > 0)?;
 
         let mut f = File::open(&self.path).map_err(|e| format!("Ошибка открытия ASAR: {e}"))?;
-        f.seek(SeekFrom::Start(self.base_offset + offset))
+        let file_len = f
+            .metadata()
+            .map_err(|e| format!("Ошибка stat ASAR: {e}"))?
+            .len();
+        let start = self
+            .base_offset
+            .checked_add(offset)
+            .ok_or_else(|| format!("Переполнение offset для {rel_path}"))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| format!("Переполнение size для {rel_path}"))?;
+        if size > MAX_ENTRY_BYTES || end > file_len {
+            return Err(format!("Запись {rel_path} выходит за пределы ASAR"));
+        }
+        let alloc_len = usize::try_from(size)
+            .map_err(|_| format!("Размер файла {rel_path} превышает usize"))?;
+        f.seek(SeekFrom::Start(start))
             .map_err(|e| format!("Ошибка seek в ASAR: {e}"))?;
-        let mut buf = vec![0u8; size as usize];
+        let mut buf = vec![0u8; alloc_len];
         if size > 0 {
             f.read_exact(&mut buf)
                 .map_err(|e| format!("Ошибка чтения файла {rel_path}: {e}"))?;
@@ -129,13 +375,17 @@ impl AsarArchive {
         };
 
         for (name, item) in files {
+            validate_entry_name(name)?;
             let full_path = if prefix.is_empty() {
                 name.clone()
             } else {
                 format!("{prefix}/{name}")
             };
 
-            if item.get("files").is_some() {
+            if let Some(sub_files_val) = item.get("files") {
+                if !sub_files_val.is_object() {
+                    return Err(format!("Некорректный каталог ASAR для {full_path}"));
+                }
                 self.traverse_node(item, &full_path, file, out)?;
             } else if let Some(link) = item.get("link").and_then(|v| v.as_str()) {
                 out.insert(
@@ -144,14 +394,19 @@ impl AsarArchive {
                         link: link.to_string(),
                     },
                 );
+            } else if item.get("link").is_some() {
+                return Err(format!("Некорректный symlink link для {full_path}"));
             } else {
                 let executable = item
                     .get("executable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let size = item.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 if item.get("unpacked").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let size = match item.get("size") {
+                        Some(v) => parse_size(Some(v), &full_path)?,
+                        None => 0,
+                    };
                     out.insert(
                         full_path,
                         AsarEntry::Unpacked {
@@ -161,10 +416,23 @@ impl AsarArchive {
                         },
                     );
                 } else {
-                    let offset = parse_offset(item.get("offset"))?;
-                    let mut buf = vec![0u8; size as usize];
+                    let size = parse_size(item.get("size"), &full_path)?;
+                    let offset = parse_offset_for_entry(item.get("offset"), &full_path, size > 0)?;
+                    let start = self
+                        .base_offset
+                        .checked_add(offset)
+                        .ok_or_else(|| format!("Переполнение offset в ASAR для {full_path}"))?;
+                    let end = start
+                        .checked_add(size)
+                        .ok_or_else(|| format!("Переполнение size в ASAR для {full_path}"))?;
+                    if size > MAX_ENTRY_BYTES || end > self.file_len {
+                        return Err(format!("Запись {full_path} выходит за пределы ASAR"));
+                    }
+                    let alloc_len = usize::try_from(size)
+                        .map_err(|_| format!("Размер файла {full_path} превышает usize"))?;
+                    let mut buf = vec![0u8; alloc_len];
                     if size > 0 {
-                        file.seek(SeekFrom::Start(self.base_offset + offset))
+                        file.seek(SeekFrom::Start(start))
                             .map_err(|e| format!("Ошибка seek {full_path}: {e}"))?;
                         file.read_exact(&mut buf)
                             .map_err(|e| format!("Ошибка чтения {full_path}: {e}"))?;
@@ -202,16 +470,34 @@ fn collect_unpacked_dirs(node: &Value, prefix: &str, out: &mut BTreeSet<String>)
     }
 }
 
-fn parse_offset(val: Option<&Value>) -> Result<u64, String> {
+fn parse_offset_for_entry(
+    val: Option<&Value>,
+    path: &str,
+    required: bool,
+) -> Result<u64, String> {
     match val {
         Some(Value::String(s)) => s
             .parse::<u64>()
-            .map_err(|e| format!("Некорректный offset '{s}': {e}")),
+            .map_err(|e| format!("Некорректный offset '{s}' для {path}: {e}")),
         Some(Value::Number(n)) => n
             .as_u64()
-            .ok_or_else(|| "Некорректный числовой offset".to_string()),
-        None => Ok(0),
-        _ => Err("Неподдерживаемый тип offset".to_string()),
+            .ok_or_else(|| format!("Некорректный числовой offset для {path}")),
+        None if !required => Ok(0),
+        None => Err(format!("Отсутствует поле offset для {path}")),
+        _ => Err(format!("Неподдерживаемый тип offset для {path}")),
+    }
+}
+
+fn parse_size(val: Option<&Value>, path: &str) -> Result<u64, String> {
+    match val {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| format!("Некорректный размер файла {path} в ASAR")),
+        Some(Value::String(s)) => s
+            .parse::<u64>()
+            .map_err(|_| format!("Некорректный строковый размер {path} в ASAR")),
+        None => Err(format!("Отсутствует поле size для {path} в ASAR")),
+        _ => Err(format!("Неподдерживаемый тип size для {path} в ASAR")),
     }
 }
 
@@ -273,9 +559,13 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
     let mut payloads: Vec<&[u8]> = Vec::new();
 
     for (rel_path, entry) in entries {
-        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        let normalized = rel_path.replace('\\', "/");
+        let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
         if parts.is_empty() {
             continue;
+        }
+        for part in &parts {
+            validate_entry_name(part)?;
         }
         let filename = parts[parts.len() - 1];
         let dirs = &parts[..parts.len() - 1];
@@ -293,6 +583,13 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
                 .or_insert_with(|| Value::Object(Map::new()))
                 .as_object_mut()
                 .ok_or("Некорректная структура дерева ASAR")?;
+            if let Some(existing) = files_map.get(*dir) {
+                if existing.get("files").and_then(|v| v.as_object()).is_none() {
+                    return Err(format!(
+                        "Конфликт путей в ASAR: '{dir_prefix}' уже существует как файл"
+                    ));
+                }
+            }
             let next = files_map.entry((*dir).to_string()).or_insert_with(|| {
                 let mut m = Map::new();
                 m.insert("files".into(), Value::Object(Map::new()));
@@ -311,6 +608,11 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .ok_or("Некорректный узел files")?;
+        if files_map.contains_key(filename) {
+            return Err(format!(
+                "Конфликт путей в ASAR: '{rel_path}' пересекается с существующим узлом"
+            ));
+        }
 
         let mut meta = Map::new();
         match entry {
@@ -322,7 +624,9 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
                     meta.insert("executable".into(), Value::Bool(true));
                 }
                 payloads.push(data.as_slice());
-                current_offset += data.len() as u64;
+                current_offset = current_offset
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| "Переполнение смещения ASAR".to_string())?;
             }
             AsarEntry::Unpacked {
                 size,
@@ -347,15 +651,25 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
 
     let mut json_bytes = serde_json::to_vec(&Value::Object(root))
         .map_err(|e| format!("Ошибка сериализации заголовка ASAR: {e}"))?;
-    let json_len = json_bytes.len() as u32;
+    if (json_bytes.len() as u64) > MAX_HEADER_JSON_BYTES {
+        return Err("Размер JSON-заголовка ASAR превышает допустимый лимит".to_string());
+    }
+    let json_len = u32::try_from(json_bytes.len())
+        .map_err(|_| "Размер JSON-заголовка ASAR превышает u32".to_string())?;
     let padding = (4 - (json_bytes.len() % 4)) % 4;
-    json_bytes.extend(std::iter::repeat_n(0u8, padding));
+    json_bytes.resize(json_bytes.len() + padding, 0u8);
 
-    let total_size = json_len + (padding as u32) + 8;
-    let payload_size = total_size - 4;
+    let total_size = json_len
+        .checked_add(padding as u32)
+        .and_then(|v| v.checked_add(8))
+        .ok_or_else(|| "Переполнение total_size заголовка ASAR".to_string())?;
+    let payload_size = total_size
+        .checked_sub(4)
+        .ok_or_else(|| "Переполнение payload_size заголовка ASAR".to_string())?;
 
     let out_path = output_path.as_ref();
-    let tmp_path = out_path.with_extension("asar.tmp");
+    let tmp_path = unique_tmp_path(out_path, "asar.tmp");
+    let mut guard = TmpFileGuard::new(tmp_path.clone());
 
     {
         let file = File::create(&tmp_path)
@@ -380,13 +694,15 @@ pub fn write_asar_with_unpacked_dirs<P: AsRef<Path>>(
         writer
             .flush()
             .map_err(|e| format!("Ошибка flush ASAR: {e}"))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| format!("Ошибка финализации буфера ASAR: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Ошибка sync_all ASAR: {e}"))?;
     }
 
-    if out_path.exists() {
-        let _ = fs::remove_file(out_path);
-    }
-    fs::rename(&tmp_path, out_path)
-        .map_err(|e| format!("Ошибка переименования временного ASAR: {e}"))?;
+    atomic_replace_with_retry(&tmp_path, out_path)?;
+    guard.disarm();
 
     #[cfg(unix)]
     {
@@ -477,5 +793,127 @@ mod tests {
             Some(AsarEntry::Symlink { link }) if link == "../target"
         ));
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn asar_rejects_oom_header_and_truncated_payload() {
+        // 1. Malicious 16-byte header claiming json_len = 0xFFFFFFFF must return Err, not OOM abort
+        let oom_path = std::env::temp_dir().join("agy_test_oom_hdr.asar");
+        let mut bad_hdr = Vec::new();
+        bad_hdr.extend_from_slice(&4u32.to_le_bytes());
+        bad_hdr.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        bad_hdr.extend_from_slice(&0xFFFFFFFBu32.to_le_bytes());
+        bad_hdr.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        fs::write(&oom_path, &bad_hdr).unwrap();
+        assert!(AsarArchive::open(&oom_path).is_err(), "OOM header must be rejected");
+        let _ = fs::remove_file(&oom_path);
+
+        // 2. Truncated archive (valid header, truncated payload) must fail verify_structural_bounds
+        let trunc_path = std::env::temp_dir().join("agy_test_truncated.asar");
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "dist/main.js".to_string(),
+            AsarEntry::Packed {
+                data: vec![b'x'; 4096],
+                executable: false,
+            },
+        );
+        write_asar(&trunc_path, &entries).unwrap();
+        let full_bytes = fs::read(&trunc_path).unwrap();
+        // Keep header intact, cut payload in half
+        fs::write(&trunc_path, &full_bytes[..full_bytes.len() - 2048]).unwrap();
+        let arc = AsarArchive::open(&trunc_path).expect("header itself is intact");
+        assert!(
+            arc.verify_structural_bounds().is_err(),
+            "Truncated payload must fail verify_structural_bounds"
+        );
+        let _ = fs::remove_file(&trunc_path);
+    }
+
+    #[test]
+    fn asar_rejects_path_traversal_node_names() {
+        let bad_path = std::env::temp_dir().join("agy_test_traversal.asar");
+        let mut json_bytes = br#"{"files":{"..":{"size":1,"offset":"0"}}}"#.to_vec();
+        let json_len = json_bytes.len() as u32;
+        let padding = (4 - (json_bytes.len() % 4)) % 4;
+        json_bytes.resize(json_bytes.len() + padding, 0u8);
+        let total_size = json_len + (padding as u32) + 8;
+        let payload_size = total_size - 4;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4u32.to_le_bytes());
+        raw.extend_from_slice(&total_size.to_le_bytes());
+        raw.extend_from_slice(&payload_size.to_le_bytes());
+        raw.extend_from_slice(&json_len.to_le_bytes());
+        raw.extend_from_slice(&json_bytes);
+        raw.push(b'A');
+        fs::write(&bad_path, &raw).unwrap();
+
+        let arc = AsarArchive::open(&bad_path).unwrap();
+        assert!(arc.verify_structural_bounds().is_err());
+        assert!(arc.read_all_entries().is_err());
+        let _ = fs::remove_file(&bad_path);
+    }
+
+    #[test]
+    fn atomic_copy_and_write_replace_existing_target() {
+        let dir = std::env::temp_dir();
+        let src = dir.join("agy_test_atomic_src.bin");
+        let dst = dir.join("agy_test_atomic_dst.bin");
+        fs::write(&src, b"new-payload-12345").unwrap();
+        fs::write(&dst, b"old-payload").unwrap();
+
+        atomic_copy_file(&src, &dst).expect("atomic_copy_file failed");
+        assert_eq!(fs::read(&dst).unwrap(), b"new-payload-12345");
+
+        atomic_write_bytes(&dst, br#"{"ok":true}"#).expect("atomic_write_bytes failed");
+        assert_eq!(fs::read(&dst).unwrap(), br#"{"ok":true}"#);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn asar_rejects_missing_root_files_and_path_collision() {
+        let missing_files_path = std::env::temp_dir().join("agy_test_missing_files.asar");
+        let mut json_bytes = br#"{"other":{}}"#.to_vec();
+        let json_len = json_bytes.len() as u32;
+        let padding = (4 - (json_bytes.len() % 4)) % 4;
+        json_bytes.resize(json_bytes.len() + padding, 0u8);
+        let total_size = json_len + (padding as u32) + 8;
+        let payload_size = total_size - 4;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4u32.to_le_bytes());
+        raw.extend_from_slice(&total_size.to_le_bytes());
+        raw.extend_from_slice(&payload_size.to_le_bytes());
+        raw.extend_from_slice(&json_len.to_le_bytes());
+        raw.extend_from_slice(&json_bytes);
+        fs::write(&missing_files_path, &raw).unwrap();
+        assert!(
+            AsarArchive::open(&missing_files_path).is_err(),
+            "ASAR header missing root 'files' object must be rejected"
+        );
+        let _ = fs::remove_file(&missing_files_path);
+
+        let coll_path = std::env::temp_dir().join("agy_test_collision.asar");
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "a".to_string(),
+            AsarEntry::Packed {
+                data: b"file".to_vec(),
+                executable: false,
+            },
+        );
+        entries.insert(
+            "a/b".to_string(),
+            AsarEntry::Packed {
+                data: b"nested".to_vec(),
+                executable: false,
+            },
+        );
+        assert!(
+            write_asar(&coll_path, &entries).is_err(),
+            "write_asar must reject file vs directory prefix collision"
+        );
+        let _ = fs::remove_file(&coll_path);
     }
 }

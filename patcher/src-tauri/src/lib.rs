@@ -4,11 +4,29 @@ mod system;
 
 use patcher::{DiagnosticsResult, ModuleOptions, PatcherStatus, ProgressEvent};
 use std::path::Path;
-use std::sync::Mutex;
-use tauri::{Emitter, State, Window};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager, State, Window};
 
 struct AppState {
     antigravity_dir: Mutex<String>,
+    op_in_progress: Arc<AtomicBool>,
+}
+
+struct OpGuard(Arc<AtomicBool>);
+
+impl OpGuard {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Result<Self, String> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(Arc::clone(flag)))
+            .map_err(|_| "Операция патчинга/отката уже выполняется.".to_string())
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[tauri::command]
@@ -24,23 +42,41 @@ async fn get_status(state: State<'_, AppState>) -> Result<PatcherStatus, String>
 }
 
 #[tauri::command]
-fn set_antigravity_dir(dir: String, state: State<'_, AppState>) -> Result<PatcherStatus, String> {
+async fn set_antigravity_dir(
+    dir: String,
+    state: State<'_, AppState>,
+) -> Result<PatcherStatus, String> {
+    if state.op_in_progress.load(Ordering::SeqCst) {
+        return Err("Нельзя менять каталог Antigravity во время выполнения операции.".to_string());
+    }
+    let trimmed = dir.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Не указан каталог Antigravity.".to_string());
+    }
     {
         let mut guard = state
             .antigravity_dir
             .lock()
             .map_err(|_| "State lock poisoned".to_string())?;
-        *guard = dir.clone();
+        if state.op_in_progress.load(Ordering::SeqCst) {
+            return Err("Нельзя менять каталог Antigravity во время выполнения операции.".to_string());
+        }
+        *guard = trimmed.clone();
     }
-    Ok(patcher::get_status(&dir))
+    tauri::async_runtime::spawn_blocking(move || patcher::get_status(&trimmed))
+        .await
+        .map_err(|e| format!("Task error: {e}"))
 }
 
 #[tauri::command]
-fn count_wallpapers(dir: String) -> usize {
-    if dir.trim().is_empty() {
+async fn count_wallpapers(dir: String) -> usize {
+    let trimmed = dir.trim().to_string();
+    if trimmed.is_empty() {
         return 0;
     }
-    system::count_workshop_items(Path::new(dir.trim()))
+    tauri::async_runtime::spawn_blocking(move || system::count_workshop_items(Path::new(&trimmed)))
+        .await
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -61,13 +97,17 @@ async fn apply_patch(
     window: Window,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if !options.antigravity_path.trim().is_empty() {
-        if let Ok(mut guard) = state.antigravity_dir.lock() {
-            *guard = options.antigravity_path.clone();
-        }
+    let op_guard = OpGuard::try_acquire(&state.op_in_progress)?;
+    let trimmed_path = options.antigravity_path.trim().to_string();
+    if trimmed_path.is_empty() {
+        return Err("Не указан каталог Antigravity.".to_string());
+    }
+    if let Ok(mut guard) = state.antigravity_dir.lock() {
+        *guard = trimmed_path;
     }
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = op_guard;
         patcher::apply_patch(&options, |stage, percent, level| {
             let _ = window.emit(
                 "patch-progress",
@@ -85,6 +125,7 @@ async fn apply_patch(
 
 #[tauri::command]
 async fn restore_original(window: Window, state: State<'_, AppState>) -> Result<(), String> {
+    let op_guard = OpGuard::try_acquire(&state.op_in_progress)?;
     let dir = state
         .antigravity_dir
         .lock()
@@ -92,6 +133,7 @@ async fn restore_original(window: Window, state: State<'_, AppState>) -> Result<
         .clone();
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = op_guard;
         patcher::restore_original(&dir, |stage, percent, level| {
             let _ = window.emit(
                 "patch-progress",
@@ -108,24 +150,30 @@ async fn restore_original(window: Window, state: State<'_, AppState>) -> Result<
 }
 
 #[tauri::command]
-fn launch_antigravity(state: State<'_, AppState>) -> Result<(), String> {
+async fn launch_antigravity(state: State<'_, AppState>) -> Result<(), String> {
     let dir = state
         .antigravity_dir
         .lock()
         .map_err(|_| "State lock poisoned".to_string())?
         .clone();
-    system::launch_antigravity(&dir)
+    tauri::async_runtime::spawn_blocking(move || system::launch_antigravity(&dir))
+        .await
+        .map_err(|e| format!("Task error: {e}"))?
 }
 
 #[tauri::command]
-fn open_custom_wallpapers() -> Result<String, String> {
-    let cust = patcher::locate_customization_dir()
-        .ok_or_else(|| "Каталог customization/ не найден.".to_string())?;
-    let custom_dir = cust.parent().unwrap_or(&cust).join("custom_wallpapers");
-    std::fs::create_dir_all(&custom_dir)
-        .map_err(|e| format!("Не удалось создать папку custom_wallpapers: {e}"))?;
-    system::open_folder_in_file_manager(&custom_dir)?;
-    Ok(custom_dir.to_string_lossy().to_string())
+async fn open_custom_wallpapers() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cust = patcher::locate_customization_dir()
+            .ok_or_else(|| "Каталог customization/ не найден.".to_string())?;
+        let custom_dir = patcher::resolve_custom_wallpapers_dir(&cust);
+        system::create_dir_all_for_sudo(&custom_dir)
+            .map_err(|e| format!("Не удалось создать папку custom_wallpapers: {e}"))?;
+        system::open_folder_in_file_manager(&custom_dir)?;
+        Ok(custom_dir.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Task error: {e}"))?
 }
 
 #[tauri::command]
@@ -144,6 +192,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             antigravity_dir: Mutex::new(detected),
+            op_in_progress: Arc::new(AtomicBool::new(false)),
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<AppState>();
+                if state.op_in_progress.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_status,

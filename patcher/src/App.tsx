@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -71,11 +72,12 @@ function ModuleIcon({ id }: { id: ModuleKey }) {
   }
 }
 
-function nowTime(): string {
-  return new Date().toLocaleTimeString("ru-RU", { hour12: false });
+function nowTime(lang: UiLang): string {
+  return new Date().toLocaleTimeString(lang === "en" ? "en-US" : "ru-RU", { hour12: false });
 }
 
 export default function App() {
+  const [appVersion, setAppVersion] = useState("2.35.0");
   const [lang, setLang] = useState<UiLang>(() => {
     const saved = localStorage.getItem("patcher_lang");
     return saved === "en" ? "en" : "ru";
@@ -130,9 +132,23 @@ export default function App() {
 
   const logIdRef = useRef(1);
   const logEndRef = useRef<HTMLDivElement | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("patcher_lang", lang);
+    document.documentElement.lang = lang;
   }, [lang]);
 
   useEffect(() => {
@@ -144,17 +160,29 @@ export default function App() {
     localStorage.setItem("patcher_backdrop", backdropMode);
   }, [backdropMode]);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setSettingsOpen(false);
+        setDrawerOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const pushLog = (text: string, level: LogLine["level"] = "info") => {
     if (level === "error") setHasErrorLog(true);
     setLogs((prev) => [
       ...prev,
-      { id: logIdRef.current++, time: nowTime(), text, level },
+      { id: logIdRef.current++, time: nowTime(lang), text, level },
     ]);
   };
 
   const refreshStatus = async (silent = false) => {
     try {
       const st = await invoke<PatcherStatus>("get_status");
+      if (!mountedRef.current) return;
       setStatus(st);
       setOptions((prev) => ({
         ...prev,
@@ -178,6 +206,7 @@ export default function App() {
         workshopDir: st.wallpaperPath || null,
       })
         .then((hint) => {
+          if (!mountedRef.current) return;
           setTheme(hint);
           if (hint.accentRgb) {
             document.documentElement.style.setProperty("--accent-rgb", hint.accentRgb);
@@ -185,14 +214,20 @@ export default function App() {
         })
         .catch(() => {});
     } catch (err) {
-      pushLog(String(err), "error");
+      if (mountedRef.current) pushLog(String(err), "error");
     }
   };
 
   useEffect(() => {
+    getVersion()
+      .then((ver) => {
+        if (mountedRef.current && ver) setAppVersion(ver);
+      })
+      .catch(() => {});
     refreshStatus();
 
     const unlistenPromise = listen<ProgressEvent>("patch-progress", (event) => {
+      if (!mountedRef.current) return;
       const payload = event.payload;
       setProgress(payload);
       pushLog(payload.stage, payload.level);
@@ -210,36 +245,41 @@ export default function App() {
   }, [logs, drawerOpen]);
 
   const handleBrowseAntigravity = async () => {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: status.antigravityPath || undefined,
-      title: t.pickAntigravityTitle,
-    });
-    if (typeof selected === "string" && selected) {
-      try {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: status.antigravityPath || undefined,
+        title: t.pickAntigravityTitle,
+      });
+      if (typeof selected === "string" && selected) {
         const st = await invoke<PatcherStatus>("set_antigravity_dir", { dir: selected });
         setStatus(st);
+        setDiag(null);
         setOptions((prev) => ({ ...prev, antigravityPath: st.antigravityPath }));
         pushLog(`Antigravity: ${selected}`);
-      } catch (err) {
-        pushLog(String(err), "error");
       }
+    } catch (err) {
+      pushLog(String(err), "error");
     }
   };
 
   const handleBrowseWallpaper = async () => {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: options.wallpaperDir || undefined,
-      title: t.pickWallpaperTitle,
-    });
-    if (typeof selected === "string" && selected) {
-      const count = await invoke<number>("count_wallpapers", { dir: selected });
-      setOptions((prev) => ({ ...prev, wallpaperDir: selected }));
-      setStatus((prev) => ({ ...prev, wallpaperPath: selected, wallpaperCount: count }));
-      pushLog(`${t.wallpaperFolder} ${selected} (${count})`);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: options.wallpaperDir || undefined,
+        title: t.pickWallpaperTitle,
+      });
+      if (typeof selected === "string" && selected) {
+        const count = await invoke<number>("count_wallpapers", { dir: selected });
+        setOptions((prev) => ({ ...prev, wallpaperDir: selected }));
+        setStatus((prev) => ({ ...prev, wallpaperPath: selected, wallpaperCount: count }));
+        pushLog(`${t.wallpaperFolder} ${selected} (${count})`);
+      }
+    } catch (err) {
+      pushLog(String(err), "error");
     }
   };
 
@@ -305,12 +345,20 @@ export default function App() {
   };
 
   const handleCopyLogs = async () => {
-    const text = logs
-      .map((l) => `[${l.time}] [${l.level.toUpperCase()}] ${l.text}`)
-      .join("\n");
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      const text = logs
+        .map((l) => `[${l.time}] [${l.level.toUpperCase()}] ${l.text}`)
+        .join("\n");
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        if (mountedRef.current) setCopied(false);
+      }, 1500);
+    } catch (err) {
+      pushLog(String(err), "error");
+    }
   };
 
   const enabledCount = MODULE_KEYS.filter((k) => options[k]).length;
@@ -321,6 +369,8 @@ export default function App() {
       ? t.patched
       : status.state === "original"
       ? t.original
+      : status.state === "corrupted"
+      ? t.corrupted
       : t.notFound;
 
   const sizeText = status.asarSize
@@ -347,7 +397,7 @@ export default function App() {
               <path d="M6.4 8.9H9.6" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
             </svg>
             <span className="brand-name">Ave Maria Patcher</span>
-            <span className="brand-ver">v2.34.0</span>
+            <span className="brand-ver">v{appVersion}</span>
           </div>
 
           <div className="win-controls">
@@ -355,6 +405,7 @@ export default function App() {
               type="button"
               className={`win-btn ${settingsOpen ? "active" : ""}`}
               aria-label={t.settingsTitle}
+              aria-expanded={settingsOpen}
               title={t.settingsTitle}
               onClick={(e) => {
                 e.stopPropagation();
@@ -380,7 +431,10 @@ export default function App() {
               type="button"
               className="win-btn close"
               aria-label={t.close}
-              onClick={() => appWindow.close()}
+              disabled={busy}
+              onClick={() => {
+                if (!busy) void appWindow.close();
+              }}
             >
               <svg width="11" height="11" viewBox="0 0 10 10" fill="none">
                 <path d="M2 2L8 8M8 2L2 8" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
@@ -513,7 +567,7 @@ export default function App() {
           {progress && (
             <div className={`glass-card progress-card ${progress.level}`}>
               <div className="progress-head">
-                <span className="progress-text">{progress.stage}</span>
+                <span className="progress-text" title={progress.stage}>{progress.stage}</span>
                 <span className="progress-pct">{progress.percent}%</span>
               </div>
               <div className="progress-track">
@@ -656,7 +710,7 @@ export default function App() {
             if (e.target === e.currentTarget) setDrawerOpen(false);
           }}
         >
-          <div className="drawer">
+          <div className="drawer" role="dialog" aria-modal="true" aria-label={t.logTitle}>
             <div className="drawer-head">
               <span className="drawer-title">{t.logTitle}</span>
               <div className="drawer-actions">

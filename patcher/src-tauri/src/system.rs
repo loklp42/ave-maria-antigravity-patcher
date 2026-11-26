@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
@@ -100,17 +101,184 @@ pub fn get_antigravity_config_dir() -> Option<PathBuf> {
     }
 }
 
-fn is_valid_antigravity_dir(dir: &Path) -> bool {
-    if dir.join("resources").join("app.asar").is_file() {
-        return true;
+/// Returns `(uid, gid)` of the invoking non-root user when running as effective root via `sudo`.
+#[cfg(unix)]
+pub fn unix_sudo_user_ids() -> Option<(u32, u32)> {
+    if !is_effective_root() {
+        return None;
     }
-    #[cfg(windows)]
-    {
-        if dir.join("Antigravity.exe").is_file() {
-            return true;
+    let sudo_user = std::env::var("SUDO_USER").ok()?;
+    let user = sudo_user.trim();
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let mut parts = line.split(':');
+            if parts.next() == Some(user) {
+                let _pw = parts.next();
+                if let (Some(uid_s), Some(gid_s)) = (parts.next(), parts.next()) {
+                    if let (Ok(uid), Ok(gid)) = (uid_s.parse::<u32>(), gid_s.parse::<u32>()) {
+                        return Some((uid, gid));
+                    }
+                }
+            }
+        }
+    }
+    let uid = std::env::var("SUDO_UID").ok()?.trim().parse::<u32>().ok()?;
+    let gid = std::env::var("SUDO_GID").ok()?.trim().parse::<u32>().ok()?;
+    Some((uid, gid))
+}
+
+#[cfg(target_os = "linux")]
+fn is_effective_root() -> bool {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                if let Some(euid) = rest.split_whitespace().nth(1) {
+                    return euid == "0";
+                }
+            }
         }
     }
     false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_effective_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
+/// Applies original user ownership when the patcher runs elevated via `sudo` on Unix.
+pub fn chown_if_sudo(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Some((uid, gid)) = unix_sudo_user_ids() {
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                if !meta.file_type().is_symlink() {
+                    let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Creates `dir` recursively and hands ownership of created/target directories to `SUDO_USER` on Unix.
+pub fn create_dir_all_for_sudo(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut missing: Vec<PathBuf> = Vec::new();
+        let mut cursor = Some(dir);
+        while let Some(p) = cursor {
+            if p.as_os_str().is_empty() || p.exists() {
+                break;
+            }
+            missing.push(p.to_path_buf());
+            cursor = p.parent();
+        }
+        fs::create_dir_all(dir)?;
+        for p in missing.into_iter().rev() {
+            chown_if_sudo(&p);
+        }
+        chown_if_sudo(dir);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Checks whether a process with `pid` is currently alive (used for stale lock reaping).
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return true; // Fail safe: assume alive if snapshot fails
+            }
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut found = false;
+            if Process32FirstW(snapshot, &mut pe) != 0 {
+                loop {
+                    if pe.th32ProcessID == pid {
+                        found = true;
+                        break;
+                    }
+                    if Process32NextW(snapshot, &mut pe) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            found
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        if Path::new("/proc").is_dir() {
+            match fs::read_to_string(proc_path.join("stat")) {
+                Ok(stat) => {
+                    if let Some(rparen) = stat.rfind(')') {
+                        let state = stat[rparen + 1..].trim_start().chars().next();
+                        return !matches!(state, Some('Z' | 'X' | 'x'));
+                    }
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => proc_path.exists(),
+            }
+        } else {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| {
+                    o.status.success()
+                        || String::from_utf8_lossy(&o.stderr)
+                            .to_lowercase()
+                            .contains("not permitted")
+                })
+                .unwrap_or(true)
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| {
+                o.status.success()
+                    || String::from_utf8_lossy(&o.stderr)
+                        .to_lowercase()
+                        .contains("not permitted")
+            })
+            .unwrap_or(true)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn is_valid_antigravity_dir(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty() && dir.join("resources").join("app.asar").is_file()
 }
 
 #[cfg(target_os = "linux")]
@@ -507,8 +675,9 @@ pub fn get_running_processes() -> Vec<RunningProcess> {
 
         let proc_dir = entry.path();
         let cmdline_raw = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
-        let cmdline_str = String::from_utf8_lossy(&cmdline_raw).replace('\0', " ");
-        if is_patcher_process(&cmdline_str) {
+        let argv0_bytes = cmdline_raw.split(|&b| b == 0).next().unwrap_or(&[]);
+        let argv0_str = String::from_utf8_lossy(argv0_bytes);
+        if is_patcher_process(&argv0_str) {
             continue;
         }
 
@@ -520,7 +689,7 @@ pub fn get_running_processes() -> Vec<RunningProcess> {
                 continue;
             }
             if let Some(base) = exe_path.file_name().and_then(|s| s.to_str()) {
-                let clean = base.trim_end_matches(" (deleted)");
+                let clean = base.strip_suffix(" (deleted)").unwrap_or(base);
                 if is_target_linux_binary_name(clean) {
                     matched_name = Some(clean.to_string());
                 }
@@ -623,14 +792,17 @@ pub fn terminate_antigravity_processes() -> bool {
     true
 }
 
+static WRITE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub fn wait_for_file_unlock(path: &Path, timeout_secs: u64) -> bool {
+    if !path.exists() {
+        return true;
+    }
+
     #[cfg(unix)]
     {
         // On POSIX/Linux, files are not locked against atomic rename when processes are stopped,
         // and root-owned files in /opt or /usr cannot be opened read+write before pkexec elevation.
-        if !path.exists() {
-            return true;
-        }
         if let Some(parent) = path.parent() {
             if !check_write_permission(parent) {
                 return true;
@@ -640,7 +812,23 @@ pub fn wait_for_file_unlock(path: &Path, timeout_secs: u64) -> bool {
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if OpenOptions::new().read(true).write(true).open(path).is_ok() {
+        if !path.exists() {
+            return true;
+        }
+        #[cfg(windows)]
+        let unlocked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(path)
+                .is_ok()
+        };
+        #[cfg(not(windows))]
+        let unlocked = OpenOptions::new().read(true).write(true).open(path).is_ok();
+
+        if unlocked {
             return true;
         }
         if Instant::now() >= deadline {
@@ -651,11 +839,27 @@ pub fn wait_for_file_unlock(path: &Path, timeout_secs: u64) -> bool {
 }
 
 pub fn check_write_permission(dir: &Path) -> bool {
-    let probe = dir.join(".agy_patcher_write_probe");
-    match fs::write(&probe, b"ok") {
-        Ok(_) => {
+    if !dir.is_dir() {
+        return false;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = WRITE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let probe = dir.join(format!(
+        ".agy_patcher_probe_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        seq
+    ));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(mut f) => {
+            use std::io::Write;
+            let write_ok = f.write_all(b"ok").is_ok();
+            drop(f);
             let _ = fs::remove_file(&probe);
-            true
+            write_ok
         }
         Err(_) => false,
     }
@@ -675,37 +879,113 @@ pub fn can_elevate() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_non_symlink_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("Не удалось проверить {label} ({}): {e}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!("Небезопасный путь {label}: {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn canonicalize_resources_dir(res_dir: &Path) -> Result<PathBuf, String> {
+    let meta = fs::symlink_metadata(res_dir)
+        .map_err(|e| format!("Каталог resources недоступен ({}): {e}", res_dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(format!("Небезопасный каталог resources: {}", res_dir.display()));
+    }
+    let canonical = fs::canonicalize(res_dir)
+        .map_err(|e| format!("Не удалось канонизировать каталог resources: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("Путь не является каталогом: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn map_pkexec_failure(action_label: &str, output: &std::process::Output) -> String {
+    match output.status.code() {
+        Some(126) => "Запрос прав администратора (pkexec) отменён пользователем.".to_string(),
+        Some(127) => {
+            "Не удалось запросить права администратора (pkexec): отсутствует или не запущен polkit-агент."
+                .to_string()
+        }
+        code => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                format!("{action_label} (код {code:?}).")
+            } else {
+                format!("{action_label}: {stderr}")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn elevated_install_asar(
     res_dir: &Path,
     staged_asar: &Path,
     staged_manifest: &Path,
+    expected_sha256: &str,
+    refresh_orig: bool,
 ) -> Result<(), String> {
+    let canonical_res_dir = canonicalize_resources_dir(res_dir)?;
+    ensure_non_symlink_regular_file(staged_asar, "staged_asar")?;
+    if !staged_manifest.as_os_str().is_empty() && staged_manifest.exists() {
+        ensure_non_symlink_regular_file(staged_manifest, "staged_manifest")?;
+    }
+
     let script = r#"
 set -eu
 res_dir="$1"
 staged_asar="$2"
 staged_manifest="$3"
+expected_sha="$4"
+refresh_orig="$5"
+[ -d "$res_dir" ] && [ ! -L "$res_dir" ] || { echo "Invalid or symlink res_dir rejected" >&2; exit 1; }
+[ -f "$staged_asar" ] && [ ! -L "$staged_asar" ] || { echo "Invalid or symlink staged_asar rejected" >&2; exit 1; }
 asar="$res_dir/app.asar"
 orig="$res_dir/app.asar.orig"
-new_asar="$res_dir/app.asar.new"
-swap_bak="$res_dir/app.asar.swap_bak"
 manifest="$res_dir/agy_patch_manifest.json"
-if [ ! -f "$orig" ]; then
-  cp -p "$asar" "$orig"
-  chmod 644 "$orig"
+[ ! -L "$asar" ] && [ ! -d "$asar" ] || { echo "Unsafe target app.asar rejected" >&2; exit 1; }
+[ ! -L "$orig" ] && [ ! -d "$orig" ] || { echo "Unsafe target app.asar.orig rejected" >&2; exit 1; }
+[ ! -L "$manifest" ] && [ ! -d "$manifest" ] || { echo "Unsafe target manifest rejected" >&2; exit 1; }
+orig_tmp=""
+new_asar=""
+manifest_tmp=""
+cleanup() {
+  rm -f -- "$orig_tmp" "$new_asar" "$manifest_tmp"
+}
+trap cleanup EXIT INT TERM
+if [ ! -f "$orig" ] || [ "$refresh_orig" = "1" ]; then
+  [ -f "$asar" ] && [ ! -L "$asar" ] || { echo "Invalid source app.asar for backup" >&2; exit 1; }
+  orig_tmp="$(mktemp -- "$res_dir/.app.asar.orig.tmp.XXXXXX")"
+  [ -f "$orig_tmp" ] && [ ! -L "$orig_tmp" ] || { echo "Unsafe orig_tmp rejected" >&2; exit 1; }
+  install -m 0644 -- "$asar" "$orig_tmp"
+  sync -- "$orig_tmp" 2>/dev/null || true
+  mv -f -- "$orig_tmp" "$orig"
+  orig_tmp=""
 fi
-cp "$staged_asar" "$new_asar"
-chmod 644 "$new_asar"
-rm -f "$swap_bak"
-mv "$asar" "$swap_bak"
-if ! mv "$new_asar" "$asar"; then
-  mv "$swap_bak" "$asar" || true
+new_asar="$(mktemp -- "$res_dir/.app.asar.new.XXXXXX")"
+[ -f "$new_asar" ] && [ ! -L "$new_asar" ] || { echo "Unsafe new_asar rejected" >&2; exit 1; }
+install -m 0644 -- "$staged_asar" "$new_asar"
+actual_sha="$(sha256sum -- "$new_asar" | awk '{print $1}')"
+if [ -n "$expected_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
+  echo "Staged ASAR checksum mismatch!" >&2
   exit 1
 fi
-rm -f "$swap_bak"
-if [ -n "$staged_manifest" ] && [ -f "$staged_manifest" ]; then
-  cp "$staged_manifest" "$manifest"
-  chmod 644 "$manifest"
+sync -- "$new_asar" 2>/dev/null || true
+mv -f -- "$new_asar" "$asar"
+new_asar=""
+if [ -n "$staged_manifest" ]; then
+  [ -f "$staged_manifest" ] && [ ! -L "$staged_manifest" ] || { echo "Unsafe staged_manifest rejected" >&2; exit 1; }
+  manifest_tmp="$(mktemp -- "$res_dir/.agy_patch_manifest.json.tmp.XXXXXX")"
+  [ -f "$manifest_tmp" ] && [ ! -L "$manifest_tmp" ] || { echo "Unsafe manifest_tmp rejected" >&2; exit 1; }
+  install -m 0644 -- "$staged_manifest" "$manifest_tmp"
+  sync -- "$manifest_tmp" 2>/dev/null || true
+  mv -f -- "$manifest_tmp" "$manifest"
+  manifest_tmp=""
 fi
 "#;
 
@@ -714,23 +994,18 @@ fi
         .arg("-c")
         .arg(script)
         .arg("_")
-        .arg(res_dir)
+        .arg(&canonical_res_dir)
         .arg(staged_asar)
         .arg(staged_manifest)
+        .arg(expected_sha256)
+        .arg(if refresh_orig { "1" } else { "0" })
         .output()
         .map_err(|e| format!("Не удалось запустить pkexec: {e}"))?;
 
     if output.status.success() {
         Ok(())
-    } else if output.status.code() == Some(126) {
-        Err("Запрос прав администратора (pkexec) отменён пользователем.".to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("Ошибка привилегированной установки (код {:?}).", output.status.code())
-        } else {
-            format!("Ошибка привилегированной установки: {stderr}")
-        })
+        Err(map_pkexec_failure("Ошибка привилегированной установки", &output))
     }
 }
 
@@ -738,53 +1013,104 @@ fi
 pub fn elevated_restore_asar(
     res_dir: &Path,
     staged_clean_asar: Option<&Path>,
+    expected_sha256: Option<&str>,
+    refresh_orig_from_live: bool,
 ) -> Result<(), String> {
+    let canonical_res_dir = canonicalize_resources_dir(res_dir)?;
+    if let Some(staged) = staged_clean_asar {
+        ensure_non_symlink_regular_file(staged, "staged_clean_asar")?;
+    }
+
     let script = r#"
 set -eu
 res_dir="$1"
 staged="$2"
+expected_sha="$3"
+refresh_orig_only="$4"
+[ -d "$res_dir" ] && [ ! -L "$res_dir" ] || { echo "Invalid or symlink res_dir rejected" >&2; exit 1; }
 asar="$res_dir/app.asar"
 orig="$res_dir/app.asar.orig"
 manifest="$res_dir/agy_patch_manifest.json"
-if [ -n "$staged" ] && [ -f "$staged" ]; then
-  cp "$staged" "$res_dir/app.asar.new"
-  chmod 644 "$res_dir/app.asar.new"
-  mv "$res_dir/app.asar.new" "$asar"
-  cp "$asar" "$orig"
-  chmod 644 "$orig"
+[ ! -L "$asar" ] && [ ! -d "$asar" ] || { echo "Unsafe target app.asar rejected" >&2; exit 1; }
+[ ! -L "$orig" ] && [ ! -d "$orig" ] || { echo "Unsafe target app.asar.orig rejected" >&2; exit 1; }
+[ ! -L "$manifest" ] && [ ! -d "$manifest" ] || { echo "Unsafe target manifest rejected" >&2; exit 1; }
+new_asar=""
+orig_tmp=""
+restore_tmp=""
+cleanup() {
+  rm -f -- "$new_asar" "$orig_tmp" "$restore_tmp"
+}
+trap cleanup EXIT INT TERM
+if [ "$refresh_orig_only" = "1" ]; then
+  [ -f "$asar" ] && [ ! -L "$asar" ] || { echo "Invalid live app.asar rejected" >&2; exit 1; }
+  orig_tmp="$(mktemp -- "$res_dir/.app.asar.orig.tmp.XXXXXX")"
+  [ -f "$orig_tmp" ] && [ ! -L "$orig_tmp" ] || { echo "Unsafe orig_tmp rejected" >&2; exit 1; }
+  install -m 0644 -- "$asar" "$orig_tmp"
+  actual_sha="$(sha256sum -- "$orig_tmp" | awk '{print $1}')"
+  if [ -n "$expected_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
+    echo "Live stock ASAR checksum mismatch!" >&2
+    exit 1
+  fi
+  sync -- "$orig_tmp" 2>/dev/null || true
+  mv -f -- "$orig_tmp" "$orig"
+  orig_tmp=""
+elif [ -n "$staged" ]; then
+  [ -f "$staged" ] && [ ! -L "$staged" ] || { echo "Invalid or symlink staged rejected" >&2; exit 1; }
+  new_asar="$(mktemp -- "$res_dir/.app.asar.new.XXXXXX")"
+  [ -f "$new_asar" ] && [ ! -L "$new_asar" ] || { echo "Unsafe new_asar rejected" >&2; exit 1; }
+  install -m 0644 -- "$staged" "$new_asar"
+  actual_sha="$(sha256sum -- "$new_asar" | awk '{print $1}')"
+  if [ -n "$expected_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
+    echo "Staged restore ASAR checksum mismatch!" >&2
+    exit 1
+  fi
+  sync -- "$new_asar" 2>/dev/null || true
+  mv -f -- "$new_asar" "$asar"
+  new_asar=""
+  orig_tmp="$(mktemp -- "$res_dir/.app.asar.orig.tmp.XXXXXX")"
+  [ -f "$orig_tmp" ] && [ ! -L "$orig_tmp" ] || { echo "Unsafe orig_tmp rejected" >&2; exit 1; }
+  install -m 0644 -- "$asar" "$orig_tmp"
+  sync -- "$orig_tmp" 2>/dev/null || true
+  mv -f -- "$orig_tmp" "$orig"
+  orig_tmp=""
 else
-  cp "$orig" "$res_dir/app.asar.restore_tmp"
-  chmod 644 "$res_dir/app.asar.restore_tmp"
-  mv "$res_dir/app.asar.restore_tmp" "$asar"
+  [ -f "$orig" ] && [ ! -L "$orig" ] || { echo "Invalid or symlink backup app.asar.orig rejected" >&2; exit 1; }
+  restore_tmp="$(mktemp -- "$res_dir/.app.asar.restore.XXXXXX")"
+  [ -f "$restore_tmp" ] && [ ! -L "$restore_tmp" ] || { echo "Unsafe restore_tmp rejected" >&2; exit 1; }
+  install -m 0644 -- "$orig" "$restore_tmp"
+  actual_sha="$(sha256sum -- "$restore_tmp" | awk '{print $1}')"
+  if [ -n "$expected_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
+    echo "Backup ASAR checksum mismatch!" >&2
+    exit 1
+  fi
+  sync -- "$restore_tmp" 2>/dev/null || true
+  mv -f -- "$restore_tmp" "$asar"
+  restore_tmp=""
 fi
-rm -f "$manifest"
+rm -f -- "$manifest"
 "#;
 
     let staged_arg = staged_clean_asar
         .map(|p| p.as_os_str().to_os_string())
         .unwrap_or_default();
+    let sha_arg = expected_sha256.unwrap_or("");
 
     let output = Command::new("pkexec")
         .arg("/bin/sh")
         .arg("-c")
         .arg(script)
         .arg("_")
-        .arg(res_dir)
+        .arg(&canonical_res_dir)
         .arg(staged_arg)
+        .arg(sha_arg)
+        .arg(if refresh_orig_from_live { "1" } else { "0" })
         .output()
         .map_err(|e| format!("Не удалось запустить pkexec: {e}"))?;
 
     if output.status.success() {
         Ok(())
-    } else if output.status.code() == Some(126) {
-        Err("Запрос прав администратора (pkexec) отменён пользователем.".to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("Ошибка привилегированного отката (код {:?}).", output.status.code())
-        } else {
-            format!("Ошибка привилегированного отката: {stderr}")
-        })
+        Err(map_pkexec_failure("Ошибка привилегированного отката", &output))
     }
 }
 
@@ -805,6 +1131,10 @@ fn linux_needs_no_sandbox(ag_dir: &Path) -> bool {
 }
 
 pub fn launch_antigravity(ag_dir: &str) -> Result<(), String> {
+    let ag_dir = ag_dir.trim();
+    if ag_dir.is_empty() {
+        return Err("Не указан каталог Antigravity.".to_string());
+    }
     #[cfg(windows)]
     {
         let exe = Path::new(ag_dir).join("Antigravity.exe");
@@ -969,6 +1299,24 @@ fn find_preview_in_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn safe_workshop_folder_candidate(raw_id: &str) -> Option<String> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains("..")
+        || trimmed.contains(['/', '\\', '\0', ':'])
+    {
+        return None;
+    }
+    // wallpaperEngine stores either folder id ("123456") or "<folder>_<filename>"
+    let folder = trimmed.split('_').next().unwrap_or(trimmed);
+    if folder.is_empty() || folder == "." || folder == ".." {
+        return None;
+    }
+    Some(folder.to_string())
+}
+
 pub fn read_theme_hint(workshop_dir: &str) -> ThemeHint {
     let mut hint = ThemeHint::default();
     let mut active_wp_id: Option<String> = None;
@@ -994,7 +1342,8 @@ pub fn read_theme_hint(workshop_dir: &str) -> ThemeHint {
                         }
                     }
                     if let Some(id) = val
-                        .get("wallpaperId")
+                        .get("currentId")
+                        .or_else(|| val.get("wallpaperId"))
                         .or_else(|| val.get("selectedId"))
                         .or_else(|| val.get("activeWallpaperId"))
                         .and_then(|v| v.as_str())
@@ -1018,9 +1367,13 @@ pub fn read_theme_hint(workshop_dir: &str) -> ThemeHint {
 
     if ws_path.is_dir() {
         if let Some(id) = active_wp_id {
-            let folder = ws_path.join(id);
-            if let Some(preview) = find_preview_in_dir(&folder) {
-                hint.backdrop_data_url = image_to_data_url(&preview);
+            if let Some(safe_folder) = safe_workshop_folder_candidate(&id) {
+                let folder = ws_path.join(&safe_folder);
+                if folder.is_dir() {
+                    if let Some(preview) = find_preview_in_dir(&folder) {
+                        hint.backdrop_data_url = image_to_data_url(&preview);
+                    }
+                }
             }
         }
         if hint.backdrop_data_url.is_none() {
@@ -1057,5 +1410,28 @@ mod tests {
     fn encode_base64_matches_rfc4648() {
         assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
         assert_eq!(encode_base64(b"antigravity"), "YW50aWdyYXZpdHk=");
+    }
+
+    #[test]
+    fn safe_workshop_folder_candidate_blocks_traversal_and_extracts_id() {
+        assert_eq!(safe_workshop_folder_candidate("123456"), Some("123456".to_string()));
+        assert_eq!(safe_workshop_folder_candidate("123456_bg.mp4"), Some("123456".to_string()));
+        assert_eq!(safe_workshop_folder_candidate("../etc/passwd"), None);
+        assert_eq!(safe_workshop_folder_candidate("..\\Windows"), None);
+        assert_eq!(safe_workshop_folder_candidate(".."), None);
+        assert_eq!(safe_workshop_folder_candidate("C:\\evil"), None);
+        assert_eq!(safe_workshop_folder_candidate(""), None);
+    }
+
+    #[test]
+    fn is_valid_antigravity_dir_requires_app_asar() {
+        let dir = std::env::temp_dir().join(format!("agy_valid_dir_{}", std::process::id()));
+        let res_dir = dir.join("resources");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&res_dir).unwrap();
+        assert!(!is_valid_antigravity_dir(&dir), "Dir without resources/app.asar must be invalid");
+        fs::write(res_dir.join("app.asar"), b"dummy").unwrap();
+        assert!(is_valid_antigravity_dir(&dir), "Dir with resources/app.asar must be valid");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

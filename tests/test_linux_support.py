@@ -15,8 +15,8 @@ from patcher_core.detector import (
     _resolve_linux_dir_from_binary,
     find_antigravity_dir,
 )
-from patcher_core.engine import AUTONOMOUS_MODULES, PATCHED_SYSTEM_FILES, PatchEngine
-from patcher_core.process_guard import _is_patcher_text
+from patcher_core.engine import AUTONOMOUS_MODULES, PATCHED_SYSTEM_FILES, PATCHER_VERSION, PatchEngine
+from patcher_core.process_guard import _extract_argv0, _is_patcher_text
 
 
 class TestLinuxSupport(unittest.TestCase):
@@ -106,7 +106,7 @@ class TestLinuxSupport(unittest.TestCase):
             # Restore original
             engine.restore_original()
             st_restored = engine.get_status()
-            self.assertEqual(st_restored["status"], "restored")
+            self.assertEqual(st_restored["status"], "original")
             restored_arc = AsarArchive(asar_path)
             self.assertIsNone(restored_arc.extract_file("dist/wallpaperEngine.js"))
             self.assertIn("node_modules/chrome-devtools-mcp", restored_arc.list_unpacked_dirs())
@@ -151,6 +151,53 @@ class TestLinuxSupport(unittest.TestCase):
             with open(fpath, "rb") as f:
                 raw = f.read()
             self.assertNotIn(b"\r\n", raw, f"{fname} must use LF line endings for Linux")
+
+    def test_windows_scripts_use_crlf_line_endings(self):
+        win_scripts = (
+            "Build-Patcher.bat",
+            "Run-Tests.bat",
+            "Launch-Patcher-GUI.bat",
+            os.path.join("customization", "scripts", "Apply-Antigravity-Theme.bat"),
+            os.path.join("customization", "scripts", "Apply-Antigravity-Theme.ps1"),
+            os.path.join("customization", "scripts", "Restore-Antigravity-Theme.ps1"),
+        )
+        for rel in win_scripts:
+            fpath = os.path.join(self.repo_root, rel)
+            self.assertTrue(os.path.isfile(fpath), f"Missing {rel}")
+            with open(fpath, "rb") as f:
+                raw = f.read()
+            self.assertIn(b"\r\n", raw, f"{rel} must use CRLF line endings on Windows")
+            self.assertNotIn(b"\n", raw.replace(b"\r\n", b""), f"{rel} must not contain bare LF line endings")
+
+    def test_process_guard_argv0_only_and_deleted_suffix(self):
+        # Opening the patcher repo inside Antigravity puts the repo name into CLI args,
+        # which must NOT trick process guard into treating IDE itself as the patcher.
+        ide_cmdline = b"/opt/Antigravity/antigravity\x00--folder-uri\x00file:///tmp/Ave%20Maria%20Patcher%20AG/AntigravityPatcher"
+        argv0 = _extract_argv0(ide_cmdline)
+        self.assertEqual(argv0, "/opt/Antigravity/antigravity")
+        self.assertFalse(_is_patcher_text(argv0))
+        self.assertTrue(_is_patcher_text("/usr/local/bin/ave-maria-patcher (deleted)"))
+        self.assertFalse(_is_patcher_text("/opt/Antigravity/antigravity (deleted)"))
+
+    def test_version_and_gitignore_hygiene(self):
+        import re
+
+        pkg_json = json.loads(open(os.path.join(self.repo_root, "patcher", "package.json"), "r", encoding="utf-8").read())
+        tauri_conf = json.loads(open(os.path.join(self.repo_root, "patcher", "src-tauri", "tauri.conf.json"), "r", encoding="utf-8").read())
+        cargo_toml = open(os.path.join(self.repo_root, "patcher", "src-tauri", "Cargo.toml"), "r", encoding="utf-8").read()
+        cargo_ver_m = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.M)
+        self.assertIsNotNone(cargo_ver_m)
+        self.assertEqual(pkg_json["version"], PATCHER_VERSION)
+        self.assertEqual(tauri_conf["version"], PATCHER_VERSION)
+        self.assertEqual(cargo_ver_m.group(1), PATCHER_VERSION)
+
+        readme = open(os.path.join(self.repo_root, "README.md"), "r", encoding="utf-8").read()
+        self.assertIn(f"version-{PATCHER_VERSION}-blue", readme)
+        self.assertIn("1.82+", readme)
+
+        gitignore = open(os.path.join(self.repo_root, ".gitignore"), "r", encoding="utf-8").read()
+        self.assertIn("custom_fonts/", gitignore)
+        self.assertIn("docs/разработка/", gitignore)
 
 
 if __name__ == "__main__":

@@ -107,12 +107,15 @@ body,
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
+  overflow: hidden;
   pointer-events: none;
 }
 
 .brand-mark {
   width: 18px;
   height: 18px;
+  flex-shrink: 0;
   color: rgb(var(--accent-rgb));
 }
 
@@ -121,10 +124,14 @@ body,
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand-ver {
   font-size: 11px;
+  flex-shrink: 0;
   color: var(--text-muted);
   padding: 1px 7px;
   border: 1px solid var(--border);
@@ -136,6 +143,8 @@ body,
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
 }
 
 .win-btn {
@@ -239,7 +248,14 @@ body,
   background: rgba(74, 222, 128, 0.11);
 }
 
-.status-pill.not_found {
+.status-pill.original {
+  color: rgb(var(--accent-rgb));
+  border-color: rgba(var(--accent-rgb), 0.30);
+  background: rgba(var(--accent-rgb), 0.10);
+}
+
+.status-pill.not_found,
+.status-pill.corrupted {
   color: var(--err);
   border-color: rgba(251, 113, 133, 0.32);
   background: rgba(251, 113, 133, 0.11);
@@ -420,7 +436,7 @@ body,
   background: rgba(255, 255, 255, 0.09);
   border: 1px solid rgba(255, 255, 255, 0.15);
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease;
+  transition: background 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .switch::after {
@@ -432,7 +448,7 @@ body,
   height: 13px;
   border-radius: 50%;
   background: rgba(226, 232, 240, 0.6);
-  transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1), background 0.16s ease;
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), background 0.2s ease;
 }
 
 .switch:checked {
@@ -467,17 +483,19 @@ body,
   align-items: center;
   justify-content: center;
   gap: 6px;
-  transition: background 0.14s, border-color 0.14s, transform 0.1s, opacity 0.14s;
+  transition: transform 0.16s cubic-bezier(0.16, 1, 0.3, 1), background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.14s ease;
   white-space: nowrap;
 }
 
 .btn:hover:not(:disabled) {
+  transform: translateY(-1px);
   background: rgba(255, 255, 255, 0.10);
   border-color: var(--border-hi);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
 }
 
 .btn:active:not(:disabled) {
-  transform: translateY(0.5px);
+  transform: translateY(0) scale(0.98);
 }
 
 .btn:disabled {

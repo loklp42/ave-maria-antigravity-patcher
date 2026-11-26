@@ -66,6 +66,7 @@ exports.registerTabHostWindow = registerTabHostWindow;
 exports.isTabHostWindow = isTabHostWindow;
 exports.setActiveHubViewForWindow = setActiveHubViewForWindow;
 exports.registerAccountTabWebContents = registerAccountTabWebContents;
+exports.unregisterWindowWebContents = unregisterWindowWebContents;
 exports.isRegisteredAccountTabWebContents = isRegisteredAccountTabWebContents;
 exports.getTabBarHeightForWindow = getTabBarHeightForWindow;
 exports.setTabBarHeightForWindow = setTabBarHeightForWindow;
@@ -234,6 +235,7 @@ const hubCurtainViewByWindow = new WeakMap();
 const hubCurtainColorByWindow = new WeakMap();
 const hubCurtainStateByWindow = new WeakMap();
 const hubSurfaceTransparentByWindow = new WeakMap();
+const hubSurfaceTransparentByView = new WeakMap();
 const windowByWebContents = new WeakMap();
 const windowByWebContentsId = new Map();
 const windowByCatcherWebContents = new WeakMap();
@@ -303,6 +305,11 @@ function setActiveHubViewForWindow(win, view, tabBarHeight) {
     if (view.webContents) {
         registerWindowWebContents(win, view.webContents);
     }
+    const isTransparent = Boolean(hubSurfaceTransparentByView.get(view));
+    hubSurfaceTransparentByWindow.set(win, isTransparent);
+    if (!view.webContents?.isDestroyed?.()) {
+        view.setBackgroundColor?.(isTransparent ? '#00000000' : getHubCurtainColor(win));
+    }
 }
 function registerAccountTabWebContents(win, contents) {
     if (!win || !contents || typeof contents !== 'object') {
@@ -319,6 +326,19 @@ function registerAccountTabWebContents(win, contents) {
     contents.once?.('destroyed', () => {
         set.delete(contents);
     });
+}
+function unregisterWindowWebContents(win, contents) {
+    if (!contents || typeof contents !== 'object') {
+        return;
+    }
+    windowByWebContents.delete(contents);
+    if (typeof contents.id === 'number') {
+        windowByWebContentsId.delete(contents.id);
+    }
+    accountTabWebContentsSet.delete(contents);
+    if (win && typeof win === 'object') {
+        accountTabWebContentsByWindow.get(win)?.delete(contents);
+    }
 }
 function isRegisteredAccountTabWebContents(contents) {
     return Boolean(contents && typeof contents === 'object' && accountTabWebContentsSet.has(contents));
@@ -629,7 +649,7 @@ function setHubCurtainColor(win, color) {
         w.setBackgroundColor?.(normalized);
         clipView?.setBackgroundColor?.(normalized);
     }
-    if (hubSurfaceTransparentByWindow.get(win) === false) {
+    if (isHubSurfaceTransparent(win) === false) {
         const hubView = hubViewByWindow.get(win);
         if (hubView && !hubView.webContents?.isDestroyed?.()) {
             hubView.setBackgroundColor?.(normalized);
@@ -686,17 +706,27 @@ function setHubSurfaceTransparent(win, transparent) {
         return;
     }
     const hubView = hubViewByWindow.get(win);
+    const next = Boolean(transparent);
     if (!hubView ||
         hubView.webContents?.isDestroyed?.() ||
-        hubSurfaceTransparentByWindow.get(win) === transparent) {
+        (Boolean(hubSurfaceTransparentByView.get(hubView)) === next &&
+            hubSurfaceTransparentByWindow.get(win) === next)) {
         return;
     }
-    hubSurfaceTransparentByWindow.set(win, transparent);
-    hubView.setBackgroundColor?.(transparent ? '#00000000' : getHubCurtainColor(win));
+    hubSurfaceTransparentByView.set(hubView, next);
+    hubSurfaceTransparentByWindow.set(win, next);
+    hubView.setBackgroundColor?.(next ? '#00000000' : getHubCurtainColor(win));
 }
 /** Returns whether `hubWcv` is currently see-through (see `setHubSurfaceTransparent`). */
 function isHubSurfaceTransparent(win) {
-    return Boolean(win && typeof win === 'object' && hubSurfaceTransparentByWindow.get(win));
+    if (!win || typeof win !== 'object') {
+        return false;
+    }
+    const hubView = hubViewByWindow.get(win);
+    if (hubView) {
+        return Boolean(hubSurfaceTransparentByView.get(hubView));
+    }
+    return Boolean(hubSurfaceTransparentByWindow.get(win));
 }
 /** Returns the trusted Hub UI `WebContents` (`hubWcv.webContents`) for `win`. */
 function getHubWebContents(win) {
@@ -1429,14 +1459,28 @@ function createWindow(url, storageManager, options) {
             hubContents.off?.('zoom-changed', handleZoomChanged);
         });
     }
-    const handleWallpaperInject = () => {
-        if (!win.isDestroyed?.() && !hubContents.isDestroyed?.()) {
-            require('./wallpaperEngine').injectWallpaperUi(hubContents);
+    let lastInjectedUrl = '';
+    const handleDidStartNav = (e) => {
+        if (e && e.isMainFrame) {
+            lastInjectedUrl = '';
         }
     };
+    const handleWallpaperInject = () => {
+        if (win.isDestroyed?.() || hubContents.isDestroyed?.()) {
+            return;
+        }
+        const curUrl = hubContents.getURL?.() || '';
+        if (curUrl && curUrl === lastInjectedUrl) {
+            return;
+        }
+        lastInjectedUrl = curUrl;
+        require('./wallpaperEngine').injectWallpaperUi(hubContents);
+    };
+    hubContents.on('did-start-navigation', handleDidStartNav);
     hubContents.on('dom-ready', handleWallpaperInject);
     hubContents.on('did-finish-load', handleWallpaperInject);
     win.on('closed', () => {
+        hubContents.off?.('did-start-navigation', handleDidStartNav);
         hubContents.off?.('dom-ready', handleWallpaperInject);
         hubContents.off?.('did-finish-load', handleWallpaperInject);
     });

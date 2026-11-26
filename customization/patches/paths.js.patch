@@ -15,7 +15,7 @@
  exports.getAppDataDirName = getAppDataDirName;
  exports.getAppDataDir = getAppDataDir;
  exports.getSettingsPbPath = getSettingsPbPath;
-@@ -51,6 +59,144 @@
+@@ -51,6 +59,161 @@
  const path_1 = __importDefault(require("path"));
  const os_1 = __importDefault(require("os"));
  const constants_1 = require("./constants");
@@ -49,7 +49,7 @@
 +        try {
 +            const fp = getActiveProfileFilePath();
 +            if (fp) {
-+                fs.writeFileSync(fp, JSON.stringify({ activeProfile: clean || 'default' }, null, 2), 'utf8');
++                fs.writeFileSync(fp, JSON.stringify({ activeProfile: clean || 'default' }, null, 2), { encoding: 'utf8', mode: 0o600 });
 +            }
 +        }
 +        catch {
@@ -114,16 +114,33 @@
 +        return electron_1.app?.getPath?.('userData') || path_1.default.join(getFallbackAppDataDir(), 'Antigravity');
 +    }
 +}
++function isSubpathWithin(parentDir, candidatePath) {
++    const resolvedParent = path_1.default.resolve(parentDir);
++    const resolvedCandidate = path_1.default.resolve(candidatePath);
++    const normParent = process.platform === 'win32' ? resolvedParent.toLowerCase() : resolvedParent;
++    const normCandidate = process.platform === 'win32' ? resolvedCandidate.toLowerCase() : resolvedCandidate;
++    const rel = path_1.default.relative(normParent, normCandidate);
++    return rel === '' || (!rel.startsWith('..') && !path_1.default.isAbsolute(rel));
++}
 +function getGeminiDirForProfile(profileId, explicitDir) {
-+    if (typeof explicitDir === 'string' && explicitDir.trim()) {
-+        return explicitDir.trim();
-+    }
 +    const profile = normalizeProfilePathId(profileId);
 +    if (profile === null) {
 +        return '';
 +    }
 +    if (!profile) {
 +        return path_1.default.join(os_1.default.homedir(), '.gemini');
++    }
++    if (typeof explicitDir === 'string' && explicitDir.trim()) {
++        const candidate = path_1.default.resolve(explicitDir.trim());
++        const allowedRoots = [
++            path_1.default.join(os_1.default.homedir(), '.gemini-profiles', profile),
++        ];
++        if (process.platform === 'win32') {
++            allowedRoots.push(path_1.default.join('C:\\ProgramData\\AntigravityAccounts', profile));
++        }
++        if (allowedRoots.some((root) => isSubpathWithin(root, candidate))) {
++            return candidate;
++        }
 +    }
 +    if (process.platform === 'win32') {
 +        const isolated = path_1.default.join('C:\\ProgramData\\AntigravityAccounts', profile, '.gemini');
@@ -160,7 +177,7 @@
  function getAppDataDirName() {
      if (!electron_1.app.isPackaged) {
          return 'antigravity-dev';
-@@ -58,10 +204,10 @@
+@@ -58,10 +221,10 @@
      return electron_1.app.getName().toLowerCase().replace(/\s+/g, '');
  }
  function getAppDataDir() {
@@ -173,7 +190,7 @@
  }
  /**
   * Returns the path to the persistent app storage file.
-@@ -128,8 +274,12 @@
+@@ -128,8 +291,12 @@
          // Missing file, foreign filesystem, or partial fs mock: leave as is.
      }
  }

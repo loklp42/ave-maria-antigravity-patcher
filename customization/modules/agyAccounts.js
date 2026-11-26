@@ -47,22 +47,140 @@ function normalizeRequestedId(raw) {
     return id && /^[a-z0-9_-]+$/.test(id) ? id : null;
 }
 
-function sanitizeQuotaList(raw) {
+function classifyTierType(tier) {
+    if (!tier) return "trial";
+    const s = [
+        typeof tier === "string" ? tier : "",
+        tier.id,
+        tier.name,
+        tier.planName,
+        tier.teamsTier,
+    ].filter(Boolean).join(" ").toLowerCase();
+    if (!s) return "trial";
+    if (s.includes("ultra")) return "ultra";
+    if (s.includes("pro") || s.includes("plus") || s.includes("paid") || s.includes("business") || s.includes("team") || s.includes("standard")) return "pro";
+    return "trial";
+}
+
+function cleanModelLabel(label) {
+    if (!label || typeof label !== "string") return "";
+    let s = label.trim();
+
+    if (/^(?:orchestrator|оркестратор)(?:\s|$|\(|\:|\-)/i.test(s)) {
+        s = s.replace(/\s*\((?:neon|неон)\)/gi, "")
+             .replace(/\s*-\s*(?:neon|неон)/gi, "")
+             .replace(/\s*:\s*(?:neon|неон)/gi, "")
+             .replace(/\b(?:gemini\s+4\s+neon|neon|неон)\b/gi, "")
+             .trim();
+    }
+
+    s = s.replace(/\s*\((?:extra\s+high|ultra\s+high|high|medium|low|максимальный|высокий|средний|низкий)\)/gi, "")
+         .replace(/\s*-\s*(?:extra\s+high|ultra\s+high|high|medium|low|максимальный|высокий|средний|низкий)$/gi, "")
+         .replace(/\s*:\s*(?:extra\s+high|ultra\s+high|high|medium|low|максимальный|высокий|средний|низкий)$/gi, "")
+         .replace(/\s+(?:extra\s+high|ultra\s+high|high|medium|low|максимальный|высокий|средний|низкий)$/gi, "")
+         .trim();
+
+    return s.replace(/\s+/g, " ");
+}
+
+function classifyFamily(lbl) {
+    const s = String(lbl || "").toLowerCase();
+    if (s.includes("claude") || s.includes("sonnet") || s.includes("opus") || s.includes("haiku") || s.includes("gpt") || /\bo[134]\b/.test(s)) {
+        return "claude_gpt";
+    }
+    if (
+        s.includes("gemini") ||
+        s.includes("argon") ||
+        s.includes("carbon") ||
+        s.includes("hydrogen") ||
+        s.includes("neon") ||
+        s.includes("orchestrator") ||
+        s.includes("оркестратор")
+    ) {
+        return "gemini";
+    }
+    return "other:" + s;
+}
+
+function normalizeQuotasForTier(quotas, tier) {
+    if (!Array.isArray(quotas) || quotas.length === 0) return [];
+    const hasTierInfo = Boolean(
+        tier &&
+        (typeof tier === "string"
+            ? tier.trim()
+            : [tier.id, tier.name, tier.planName, tier.teamsTier].some((v) => typeof v === "string" && v.trim()))
+    );
+    const tierType = hasTierInfo ? classifyTierType(tier) : "unknown";
+    const out = [];
+    const seen = new Set();
+    let geminiGroup = null;
+    let claudeGroup = null;
+
+    const mergeIntoGroup = (group, q, defaultLabel) => {
+        if (!group) return { ...q, label: defaultLabel };
+        if (q.remainingFraction >= 0) {
+            group.remainingFraction = group.remainingFraction < 0
+                ? q.remainingFraction
+                : Math.min(group.remainingFraction, q.remainingFraction);
+        }
+        if (!group.resetTime && q.resetTime) group.resetTime = q.resetTime;
+        return group;
+    };
+
+    for (const q of quotas) {
+        if (!q || typeof q !== "object") continue;
+        const lbl = cleanModelLabel(String(q.label || q.modelId || ""));
+        if (!lbl) continue;
+
+        // Automatically hide locked/unavailable models (0% with no active resetTime, or 0% on Trial)
+        if (q.remainingFraction === 0 && (!q.resetTime || tierType === "trial")) continue;
+
+        const fam = classifyFamily(lbl);
+        if (fam === "gemini") {
+            geminiGroup = mergeIntoGroup(geminiGroup, q, "Gemini Models");
+            continue;
+        }
+        if (fam === "claude_gpt") {
+            claudeGroup = mergeIntoGroup(claudeGroup, q, "Claude & GPT");
+            continue;
+        }
+
+        const normKey = lbl.toLowerCase();
+        if (seen.has(normKey)) {
+            const existing = out.find((item) => item.label.toLowerCase() === normKey);
+            if (existing && q.remainingFraction >= 0) {
+                existing.remainingFraction = existing.remainingFraction < 0
+                    ? q.remainingFraction
+                    : Math.min(existing.remainingFraction, q.remainingFraction);
+            }
+            continue;
+        }
+        seen.add(normKey);
+        out.push({ ...q, label: lbl });
+    }
+
+    if (claudeGroup) out.push(claudeGroup);
+    if (geminiGroup) out.unshift(geminiGroup);
+    return out;
+}
+
+function sanitizeQuotaList(raw, tier) {
     if (!Array.isArray(raw)) return [];
     const out = [];
     for (const item of raw) {
         if (!item || typeof item !== "object") continue;
-        const label = String(item.label || item.modelId || "").trim().slice(0, 80);
+        const label = cleanModelLabel(String(item.label || item.modelId || "").trim().slice(0, 80));
         if (!label) continue;
         const modelId = String(item.modelId || label).trim().slice(0, 120);
-        let remainingFraction = Number(item.remainingFraction);
+        const rawFrac = item.remainingFraction;
+        let remainingFraction = (rawFrac === null || rawFrac === undefined || rawFrac === "") ? NaN : Number(rawFrac);
         if (!Number.isFinite(remainingFraction)) remainingFraction = -1;
         else remainingFraction = Math.max(0, Math.min(1, remainingFraction));
         const resetTime = typeof item.resetTime === "string" ? item.resetTime.trim().slice(0, 64) : "";
         out.push({ modelId, label, remainingFraction, resetTime });
         if (out.length >= 24) break;
     }
-    return out;
+    return normalizeQuotasForTier(out, tier);
 }
 
 function sanitizeTier(raw) {
@@ -86,13 +204,30 @@ function sanitizeTier(raw) {
     };
 }
 
+function sanitizeAvatarUrl(raw) {
+    const rawAvatar = typeof raw === "string" ? raw.trim() : "";
+    if (!rawAvatar || rawAvatar.length > 65536) return "";
+    if (/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(rawAvatar)) {
+        return rawAvatar;
+    }
+    if (rawAvatar.length <= 1024) {
+        try {
+            const u = new URL(rawAvatar);
+            if (u.protocol === "https:") return u.toString();
+        } catch {}
+    }
+    return "";
+}
+
 function serializeAccount(account) {
     const id = sanitizeId(account.id);
     const isDefault = id === "default";
     const isolationMode = isDefault
         ? "native"
         : (process.platform === "win32"
-            ? (account.isolationMode === "winuser" || account.winUser ? "winuser" : "winuser")
+            ? (account.isolationMode === "winuser" || account.winUser
+                ? "winuser"
+                : (account.isolationMode === "legacy" ? "legacy" : "winuser"))
             : "profile");
     const winUser = isDefault ? "" : (typeof account.winUser === "string" ? account.winUser.trim() : "");
     const geminiDir = isDefault
@@ -101,17 +236,18 @@ function serializeAccount(account) {
             ? account.geminiDir.trim()
             : (winUser && winIsolation ? winIsolation.getIsolatedGeminiDir(id) : ""));
 
+    const sanitizedTier = sanitizeTier(account.tier);
     return {
         id,
         customLabel: typeof account.customLabel === "string" ? account.customLabel.trim().slice(0, 48) : "",
         displayName: typeof account.displayName === "string" ? account.displayName.trim().slice(0, 80) : "",
         email: typeof account.email === "string" ? account.email.trim().slice(0, 120) : "",
-        avatar: typeof account.avatar === "string" ? account.avatar.trim() : "",
+        avatar: sanitizeAvatarUrl(account.avatar),
         isolationMode,
         winUser,
         geminiDir,
-        tier: sanitizeTier(account.tier),
-        quotas: sanitizeQuotaList(account.quotas),
+        tier: sanitizedTier,
+        quotas: sanitizeQuotaList(account.quotas, sanitizedTier),
         quotaUpdatedAt: Number(account.quotaUpdatedAt) || 0,
         createdAt: Number(account.createdAt) || Date.now(),
         lastUsedAt: Number(account.lastUsedAt) || Date.now(),
@@ -186,8 +322,9 @@ function updateRuntimeState(accountId, patch = {}, shouldEmit = true) {
         changed = true;
     }
 
-    // Derive coherent live status if tab is running and not starting/error
-    if (rt.tabOpen && rt.status !== "starting" && rt.status !== "error") {
+    // Derive coherent live status if tab or background server is running and not starting/error
+    const isLive = rt.tabOpen || getRunningProfileSet().has(id);
+    if (isLive && rt.status !== "starting" && rt.status !== "error") {
         const derived = rt.waitingForUser
             ? "waiting"
             : (rt.activeAgentCount > 0 ? "working" : "ready");
@@ -195,7 +332,7 @@ function updateRuntimeState(accountId, patch = {}, shouldEmit = true) {
             rt.status = derived;
             changed = true;
         }
-    } else if (!rt.tabOpen && !getRunningProfileSet().has(id) && rt.status !== "starting") {
+    } else if (!isLive && rt.status !== "starting") {
         if (rt.status !== "stopped" || rt.activeAgentCount !== 0 || rt.waitingForUser || rt.isLiveQuota) {
             rt.status = "stopped";
             rt.activeAgentCount = 0;
@@ -283,19 +420,49 @@ function decorateAccounts(list) {
     });
 }
 
-function loadRawAccounts() {
+let _accountsCache = { file: "", mtimeMs: -1, size: -1, list: null };
+
+function readAccountsListFromDisk(filePath) {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+        .filter((a) => a && typeof a === "object" && a.id)
+        .map((a) => serializeAccount(a));
+}
+
+function loadRawAccounts(forceFresh = false) {
     const file = getAccountsFile();
-    let list = [];
+    if (!forceFresh && _accountsCache.file === file && Array.isArray(_accountsCache.list)) {
+        try {
+            const st = fs.statSync(file);
+            if (st.mtimeMs === _accountsCache.mtimeMs && st.size === _accountsCache.size) {
+                return _accountsCache.list.map((a) => serializeAccount(a));
+            }
+        } catch {}
+    }
+
+    let list = null;
     try {
         if (fs.existsSync(file)) {
-            const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-            if (Array.isArray(parsed)) {
-                list = parsed
-                    .filter((a) => a && typeof a === "object" && a.id)
-                    .map((a) => serializeAccount(a));
-            }
+            list = readAccountsListFromDisk(file);
         }
-    } catch {}
+    } catch {
+        list = null;
+    }
+
+    // Fallback to .bak if primary agy_accounts.json was corrupted mid-write
+    if (!list) {
+        const bakFile = `${file}.bak`;
+        try {
+            if (fs.existsSync(bakFile)) {
+                list = readAccountsListFromDisk(bakFile);
+            }
+        } catch {
+            list = null;
+        }
+    }
+
+    if (!Array.isArray(list)) list = [];
 
     if (!list.some((a) => a.id === "default")) {
         list.unshift(serializeAccount({
@@ -308,6 +475,17 @@ function loadRawAccounts() {
             createdAt: Date.now(),
             lastUsedAt: Date.now(),
         }));
+    }
+
+    try {
+        if (fs.existsSync(file)) {
+            const st = fs.statSync(file);
+            _accountsCache = { file, mtimeMs: st.mtimeMs, size: st.size, list: list.map((a) => serializeAccount(a)) };
+        } else {
+            _accountsCache = { file: "", mtimeMs: -1, size: -1, list: null };
+        }
+    } catch {
+        _accountsCache = { file: "", mtimeMs: -1, size: -1, list: null };
     }
     return list;
 }
@@ -335,66 +513,133 @@ function getAccountsSnapshot() {
     };
 }
 
-function saveAccounts(list) {
+let _saveTmpSeq = 0;
+
+function sleepSyncMs(ms) {
+    if (!(ms > 0)) return;
     try {
-        const file = getAccountsFile();
+        if (typeof SharedArrayBuffer === "function" && typeof Atomics === "object" && typeof Atomics.wait === "function") {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+            return;
+        }
+    } catch {}
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* fallback */ }
+}
+
+function renameOverWithRetrySync(src, dst) {
+    const delays = [25, 50, 100, 150, 200];
+    for (let i = 0; i <= delays.length; i++) {
+        try {
+            fs.renameSync(src, dst);
+            return;
+        } catch (err) {
+            const code = err && err.code;
+            const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+            if (!retryable || i === delays.length) throw err;
+            sleepSyncMs(delays[i]);
+        }
+    }
+}
+
+function saveAccounts(list) {
+    const file = getAccountsFile();
+    const tmp = `${file}.${process.pid}.${Date.now()}.${++_saveTmpSeq}.tmp`;
+    try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, JSON.stringify(list.map(serializeAccount), null, 2), "utf8");
+        const serialized = list.map(serializeAccount);
+        const payload = JSON.stringify(serialized, null, 2);
+        fs.writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });
+        try {
+            if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak`);
+        } catch {}
+        renameOverWithRetrySync(tmp, file);
+        try {
+            const st = fs.statSync(file);
+            _accountsCache = { file, mtimeMs: st.mtimeMs, size: st.size, list: serialized };
+        } catch {
+            _accountsCache = { file: "", mtimeMs: -1, size: -1, list: null };
+        }
         return true;
     } catch {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+        _accountsCache = { file: "", mtimeMs: -1, size: -1, list: null };
         return false;
     }
 }
 
+function mutateAccounts(mutator) {
+    const fresh = loadRawAccounts(true);
+    const next = mutator(fresh) || fresh;
+    if (!saveAccounts(next)) {
+        throw new Error("Failed to save accounts storage");
+    }
+    return next;
+}
+
 function syncCurrentAccount(profileId, info) {
     const id = sanitizeId(profileId || getActiveProfileId());
-    const list = loadRawAccounts();
-    let item = list.find((a) => a.id === id);
-    if (!item) {
-        item = serializeAccount({ id, createdAt: Date.now(), lastUsedAt: Date.now() });
-        list.push(item);
+    const initialList = loadRawAccounts(true);
+    if (!initialList.some((a) => a.id === id) && id !== "default") {
+        return { ok: false, error: "unknown_account", accounts: decorateAccounts(initialList) };
     }
 
     const displayName = String(info?.displayName || "").trim();
     const email = String(info?.email || "").trim();
     const avatar = String(info?.avatar || "").trim();
-    const emailOwnedByOther = email && list.some((a) => a.id !== id && a.email && a.email.toLowerCase() === email.toLowerCase());
-    let diskChanged = false;
-
-    if (!emailOwnedByOther || !item.email) {
-        if (displayName && item.displayName !== displayName) { item.displayName = displayName; diskChanged = true; }
-        if (email && item.email !== email) { item.email = email; diskChanged = true; }
-        if (avatar && item.avatar !== avatar) { item.avatar = avatar; diskChanged = true; }
-    }
-
     const nextTier = sanitizeTier(info?.tier);
-    if (nextTier && JSON.stringify(nextTier) !== JSON.stringify(item.tier)) {
-        item.tier = nextTier;
-        diskChanged = true;
-    }
+    const hasFile = fs.existsSync(getAccountsFile());
 
-    const nextQuotas = sanitizeQuotaList(info?.quotas);
-    if (nextQuotas.length > 0) {
-        const prevJson = JSON.stringify(item.quotas || []);
-        const nextJson = JSON.stringify(nextQuotas);
-        if (prevJson !== nextJson || !item.quotaUpdatedAt) {
-            item.quotas = nextQuotas;
-            item.quotaUpdatedAt = Date.now();
-            diskChanged = true;
-        } else if (Date.now() - (item.quotaUpdatedAt || 0) > 60000) {
-            item.quotaUpdatedAt = Date.now();
+    let diskChanged = false;
+    let nextQuotasForRuntime = [];
+    let finalList = initialList;
+
+    const applySync = (list) => {
+        let item = list.find((a) => a.id === id);
+        if (!item) {
+            if (id !== "default") return list;
+            item = serializeAccount({ id, createdAt: Date.now(), lastUsedAt: Date.now() });
+            list.push(item);
             diskChanged = true;
         }
-    }
+        const emailOwnedByOther = email && list.some((a) => a.id !== id && a.email && a.email.toLowerCase() === email.toLowerCase());
+        if (!emailOwnedByOther || !item.email) {
+            if (displayName && item.displayName !== displayName) { item.displayName = displayName; diskChanged = true; }
+            if (email && item.email !== email) { item.email = email; diskChanged = true; }
+            if (avatar && item.avatar !== avatar) { item.avatar = avatar; diskChanged = true; }
+        }
+        if (nextTier && JSON.stringify(nextTier) !== JSON.stringify(item.tier)) {
+            item.tier = nextTier;
+            diskChanged = true;
+        }
+        const nextQuotas = sanitizeQuotaList(info?.quotas, nextTier || item.tier);
+        nextQuotasForRuntime = nextQuotas;
+        if (nextQuotas.length > 0) {
+            const prevJson = JSON.stringify(item.quotas || []);
+            const nextJson = JSON.stringify(nextQuotas);
+            if (prevJson !== nextJson || !item.quotaUpdatedAt) {
+                item.quotas = nextQuotas;
+                item.quotaUpdatedAt = Date.now();
+                diskChanged = true;
+            } else if (Date.now() - (item.quotaUpdatedAt || 0) > 60000) {
+                item.quotaUpdatedAt = Date.now();
+                diskChanged = true;
+            }
+        }
+        item.lastUsedAt = Date.now();
+        return list;
+    };
 
-    item.lastUsedAt = Date.now();
-    if (diskChanged || !fs.existsSync(getAccountsFile())) {
-        saveAccounts(list);
+    try {
+        finalList = mutateAccounts(applySync);
+    } catch {
+        // Fallback when disk write fails, keep in-memory state consistent without false disk claim
+        if (!hasFile) diskChanged = false;
     }
 
     // Update live runtime fields (status / agent count / live quota flag)
     const runtimePatch = {};
-    if (nextQuotas.length > 0 || nextTier) runtimePatch.isLiveQuota = true;
+    if (nextQuotasForRuntime.length > 0 || nextTier) runtimePatch.isLiveQuota = true;
     if (typeof info?.waitingForUser === "boolean") runtimePatch.waitingForUser = info.waitingForUser;
     if (typeof info?.activeAgentCount === "number" && Number.isFinite(info.activeAgentCount)) {
         runtimePatch.activeAgentCount = info.activeAgentCount;
@@ -406,7 +651,7 @@ function syncCurrentAccount(profileId, info) {
     if (diskChanged || Object.keys(runtimePatch).length > 0) {
         emitAccountsChanged("sync");
     }
-    return decorateAccounts(list);
+    return decorateAccounts(finalList);
 }
 
 function spawnProfileWindow(profileId) {
@@ -465,8 +710,18 @@ async function addAccount(customLabel = "", openInNewWindow = false, opts = {}) 
         lastUsedAt: Date.now(),
     });
 
-    list.push(newItem);
-    saveAccounts(list);
+    try {
+        mutateAccounts((fresh) => {
+            if (!fresh.some((a) => a.id === id)) fresh.push(newItem);
+        });
+    } catch (err) {
+        if (winUser && winIsolation) {
+            try { await winIsolation.removeIsolatedAccount(id, winUser); } catch {}
+        } else {
+            try { await fs.promises.rm(geminiDir, { recursive: true, force: true }); } catch {}
+        }
+        return { ok: false, error: "save_failed", message: String(err?.message || err), list: loadAccounts() };
+    }
     emitAccountsChanged("add");
 
     if (openInNewWindow) {
@@ -474,8 +729,7 @@ async function addAccount(customLabel = "", openInNewWindow = false, opts = {}) 
             spawnProfileWindow(id);
             return { ok: true, id, target: id, mode: "window", list: loadAccounts() };
         } catch (err) {
-            const rolled = list.filter((a) => a.id !== id);
-            saveAccounts(rolled);
+            const rolled = mutateAccounts((fresh) => fresh.filter((a) => a.id !== id));
             return { ok: false, error: "window_start_failed", message: String(err?.message || err), list: decorateAccounts(rolled) };
         }
     }
@@ -496,12 +750,11 @@ async function addAccount(customLabel = "", openInNewWindow = false, opts = {}) 
             await lsMod.switchActiveProfileInPlace(id);
             return { ok: true, id, target: id, mode: "in-place", list: loadAccounts() };
         } catch (err) {
-            const rolled = loadRawAccounts().filter((a) => a.id !== id);
-            saveAccounts(rolled);
+            const rolled = mutateAccounts((fresh) => fresh.filter((a) => a.id !== id));
             if (winUser && winIsolation) {
                 try { await winIsolation.removeIsolatedAccount(id, winUser); } catch {}
             } else {
-                try { if (fs.existsSync(geminiDir)) fs.rmSync(geminiDir, { recursive: true, force: true }); } catch {}
+                try { await fs.promises.rm(geminiDir, { recursive: true, force: true }); } catch {}
             }
             return { ok: false, error: "profile_start_failed", message: String(err?.message || err), list: decorateAccounts(rolled) };
         }
@@ -511,8 +764,7 @@ async function addAccount(customLabel = "", openInNewWindow = false, opts = {}) 
         spawnProfileWindow(id);
         return { ok: true, id, target: id, mode: "window", list: loadAccounts() };
     } catch (err) {
-        const rolled = list.filter((a) => a.id !== id);
-        saveAccounts(rolled);
+        const rolled = mutateAccounts((fresh) => fresh.filter((a) => a.id !== id));
         return { ok: false, error: "window_start_failed", message: String(err?.message || err), list: decorateAccounts(rolled) };
     }
 }
@@ -525,29 +777,44 @@ async function repairAccountIsolation(profileId) {
     if (process.platform !== "win32" || !winIsolation) {
         return { ok: false, error: "unsupported_platform", list: loadAccounts() };
     }
-    const list = loadRawAccounts();
-    const item = list.find((a) => a.id === id);
-    if (!item) return { ok: false, error: "not_found", list: decorateAccounts(list) };
+    const existing = loadRawAccounts().find((a) => a.id === id);
+    if (!existing) return { ok: false, error: "not_found", list: loadAccounts() };
 
-    const prov = await winIsolation.provisionIsolatedAccount(id, item.winUser || "");
+    const prov = await winIsolation.provisionIsolatedAccount(id, existing.winUser || "");
     if (!prov.ok) {
-        return { ok: false, error: prov.error, message: prov.message, list: decorateAccounts(list) };
+        return { ok: false, error: prov.error, message: prov.message, list: loadAccounts() };
     }
-    item.winUser = prov.winUser;
-    item.geminiDir = prov.geminiDir;
-    item.isolationMode = "winuser";
-    saveAccounts(list);
+    try {
+        mutateAccounts((fresh) => {
+            const target = fresh.find((a) => a.id === id);
+            if (target) {
+                target.winUser = prov.winUser;
+                target.geminiDir = prov.geminiDir;
+                target.isolationMode = "winuser";
+            }
+        });
+    } catch (err) {
+        return { ok: false, error: "save_failed", message: String(err?.message || err), list: loadAccounts() };
+    }
     emitAccountsChanged("repair");
     return { ok: true, id, winUser: prov.winUser, list: loadAccounts() };
 }
 
 function renameAccount(profileId, newLabel) {
     const id = sanitizeId(profileId);
-    const list = loadRawAccounts();
-    const item = list.find((a) => a.id === id);
-    if (!item) return { ok: false, error: "not_found", list: decorateAccounts(list) };
-    item.customLabel = String(newLabel || "").trim().slice(0, 48);
-    saveAccounts(list);
+    let found = false;
+    try {
+        mutateAccounts((fresh) => {
+            const item = fresh.find((a) => a.id === id);
+            if (!item) return fresh;
+            found = true;
+            item.customLabel = String(newLabel || "").trim().slice(0, 48);
+            return fresh;
+        });
+    } catch (err) {
+        return { ok: false, error: "save_failed", message: String(err?.message || err), list: loadAccounts() };
+    }
+    if (!found) return { ok: false, error: "not_found", list: loadAccounts() };
     emitAccountsChanged("rename");
     return { ok: true, list: loadAccounts() };
 }
@@ -593,22 +860,42 @@ async function deleteAccount(profileId, activeProfileId, purgeData = true) {
     if (purgeData && targetItem?.winUser && winIsolation) {
         try {
             const rem = await winIsolation.removeIsolatedAccount(id, targetItem.winUser);
-            if (!rem.ok && rem.error === "uac_cancelled") {
-                return { ok: false, error: "uac_cancelled", message: rem.message, list: loadAccounts() };
+            if (!rem.ok && (rem.error === "uac_cancelled" || rem.error === "uac_failed" || rem.error === "uac_action_failed")) {
+                return { ok: false, error: rem.error, message: rem.message, list: loadAccounts() };
             }
         } catch {}
     }
 
-    const next = list.filter((a) => a.id !== id);
-    saveAccounts(next);
+    try {
+        mutateAccounts((fresh) => fresh.filter((a) => a.id !== id));
+    } catch (err) {
+        return { ok: false, error: "save_failed", message: String(err?.message || err), list: loadAccounts() };
+    }
     _runtimeByAccount.delete(id);
 
     if (purgeData && id.startsWith("acc_")) {
+        try {
+            const { session } = require("electron");
+            const ses = session?.fromPartition?.(`persist:agy_${id}`);
+            if (ses) {
+                if (typeof ses.clearStorageData === "function") {
+                    await Promise.resolve(ses.clearStorageData()).catch(() => {});
+                }
+                if (typeof ses.clearCache === "function") {
+                    await Promise.resolve(ses.clearCache()).catch(() => {});
+                }
+            }
+        } catch {}
         const userDataDir = path.join(getAppDataRoot(), "Antigravity-Profiles", id);
         const legacyGeminiDir = path.join(os.homedir(), ".gemini-profiles", id);
-        for (const dir of [userDataDir, legacyGeminiDir]) {
+        let partDir = "";
+        try {
+            const baseUserData = electronApp?.getPath?.("userData");
+            if (baseUserData) partDir = path.join(baseUserData, "Partitions", `agy_${id}`);
+        } catch {}
+        for (const dir of [userDataDir, legacyGeminiDir, partDir].filter(Boolean)) {
             try {
-                if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+                await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
         }
     }
@@ -620,9 +907,17 @@ async function switchAccount(targetProfileId, activeProfileId, openInNewWindow =
     const target = normalizeRequestedId(targetProfileId);
     if (!target) return { ok: false, error: "invalid_account_id" };
 
-    const list = loadRawAccounts();
-    const item = list.find((a) => a.id === target);
-    if (!item) return { ok: false, error: "not_found", target };
+    const existing = loadRawAccounts().find((a) => a.id === target);
+    if (!existing) return { ok: false, error: "not_found", target };
+
+    const touchLastUsed = () => {
+        try {
+            mutateAccounts((fresh) => {
+                const it = fresh.find((a) => a.id === target);
+                if (it) it.lastUsedAt = Date.now();
+            });
+        } catch {}
+    };
 
     if (openInNewWindow) {
         try {
@@ -630,8 +925,7 @@ async function switchAccount(targetProfileId, activeProfileId, openInNewWindow =
         } catch {
             return { ok: false, error: "window_start_failed", target };
         }
-        item.lastUsedAt = Date.now();
-        saveAccounts(list);
+        touchLastUsed();
         emitAccountsChanged("switch");
         return { ok: true, target, mode: "window", list: loadAccounts() };
     }
@@ -639,8 +933,7 @@ async function switchAccount(targetProfileId, activeProfileId, openInNewWindow =
     // Prefer seamless BaseWindow + WebContentsView tab switching
     const tm = getTabManager();
     if (tm && typeof tm.hasMainWindow === "function" && tm.hasMainWindow()) {
-        item.lastUsedAt = Date.now();
-        saveAccounts(list);
+        touchLastUsed();
         const res = await tm.openOrActivateAccount(target);
         return { ...res, target, mode: "tab", list: loadAccounts() };
     }
@@ -652,8 +945,7 @@ async function switchAccount(targetProfileId, activeProfileId, openInNewWindow =
     if (lsMod && typeof lsMod.switchActiveProfileInPlace === "function") {
         try {
             const sw = await lsMod.switchActiveProfileInPlace(target);
-            item.lastUsedAt = Date.now();
-            saveAccounts(list);
+            touchLastUsed();
             emitAccountsChanged("switch");
             return { ok: true, target, mode: "in-place", reused: !!sw?.reused, list: loadAccounts() };
         } catch (err) {
@@ -666,8 +958,7 @@ async function switchAccount(targetProfileId, activeProfileId, openInNewWindow =
     } catch {
         return { ok: false, error: "window_start_failed", target };
     }
-    item.lastUsedAt = Date.now();
-    saveAccounts(list);
+    touchLastUsed();
     return { ok: true, target, mode: "window", list: loadAccounts() };
 }
 
@@ -686,6 +977,7 @@ module.exports = {
     getAccountById,
     getAccountsSnapshot,
     saveAccounts,
+    mutateAccounts,
     syncCurrentAccount,
     updateRuntimeState,
     getRuntimeState,
@@ -698,4 +990,12 @@ module.exports = {
     deleteAccount,
     switchAccount,
     grantFolderAccessForAccount,
+    classifyTierType,
+    cleanModelLabel,
+    classifyFamily,
+    normalizeQuotasForTier,
+    sanitizeQuotaList,
+    sanitizeTier,
+    sanitizeAvatarUrl,
+    serializeAccount,
 };

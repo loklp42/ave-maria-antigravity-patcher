@@ -19,7 +19,7 @@ if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
 fi
 
 if [ ! -d "node_modules" ]; then
-  npm ci
+  npm ci --no-fund --no-audit
 fi
 
 if ! cargo tauri --version >/dev/null 2>&1; then
@@ -31,7 +31,11 @@ cargo tauri build --no-bundle
 
 BIN_SRC="$SCRIPT_DIR/patcher/src-tauri/target/release/ave-maria-patcher"
 BIN_DST="$SCRIPT_DIR/AntigravityPatcher"
-cp -f "$BIN_SRC" "$BIN_DST"
+if [ ! -f "$BIN_SRC" ]; then
+  echo "[ERROR] Built binary not found: $BIN_SRC" >&2
+  exit 1
+fi
+cp -f -- "$BIN_SRC" "$BIN_DST"
 chmod +x "$BIN_DST"
 
 echo "[OK] Built $BIN_DST"

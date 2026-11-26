@@ -35,11 +35,89 @@ try {
 } catch {}
 let _viewMode = "picker"; // "picker" | "tab"
 let _activeAccountId = "";
+let _pendingActivationAccountId = "";
+let _pendingActivationSeq = 0;
 let _tabOrder = [];
 let _onActiveLsChanged = null;
 let _lastOverlaySymbolColor = "#f1f5f9";
 let _isQuitting = false;
 let _detachResizeListeners = null;
+let _proxyRefreshTimer = null;
+let _oauthSeq = 0;
+const _pendingOAuthQueue = []; // Array<{ tokenId: string, accountId: string, state: string, ts: number }>
+
+function pruneExpiredOAuth(maxAgeMs, now) {
+    for (let i = _pendingOAuthQueue.length - 1; i >= 0; i--) {
+        if (now - _pendingOAuthQueue[i].ts > maxAgeMs) {
+            _pendingOAuthQueue.splice(i, 1);
+        }
+    }
+}
+
+function extractOAuthStateParam(rawUrl) {
+    try {
+        return new URL(String(rawUrl || "")).searchParams.get("state") || "";
+    } catch {
+        return "";
+    }
+}
+
+function recordOAuthInitiator(accountId, url, now = Date.now()) {
+    try {
+        const u = new URL(String(url || ""));
+        if (u.protocol === "https:" && /(?:^|\.)accounts\.google\.com$/i.test(u.hostname)) {
+            pruneExpiredOAuth(30 * 60 * 1000, now);
+            const state = u.searchParams.get("state") || "";
+            const entry = {
+                tokenId: String(++_oauthSeq),
+                accountId: String(accountId || "default"),
+                state,
+                ts: now,
+            };
+            _pendingOAuthQueue.push(entry);
+            while (_pendingOAuthQueue.length > 32) {
+                _pendingOAuthQueue.shift();
+            }
+            return true;
+        }
+    } catch {}
+    return false;
+}
+
+function peekOAuthInitiator(maxAgeMs = 5 * 60 * 1000, now = Date.now(), callbackUrl = "") {
+    pruneExpiredOAuth(maxAgeMs, now);
+    if (_pendingOAuthQueue.length === 0) return null;
+    const cbState = callbackUrl ? extractOAuthStateParam(callbackUrl) : "";
+    if (cbState) {
+        const matched = _pendingOAuthQueue.find((x) => x.state && x.state === cbState);
+        if (matched) return { tokenId: matched.tokenId, accountId: matched.accountId };
+    }
+    const head = _pendingOAuthQueue[0];
+    return head ? { tokenId: head.tokenId, accountId: head.accountId } : null;
+}
+
+function consumeOAuthInitiator(maxAgeMs = 5 * 60 * 1000, now = Date.now(), callbackUrl = "", tokenId = "") {
+    pruneExpiredOAuth(maxAgeMs, now);
+    if (_pendingOAuthQueue.length === 0) return "";
+    if (tokenId) {
+        const idx = _pendingOAuthQueue.findIndex((x) => x.tokenId === tokenId);
+        if (idx >= 0) {
+            const [item] = _pendingOAuthQueue.splice(idx, 1);
+            return item.accountId;
+        }
+        return "";
+    }
+    const cbState = callbackUrl ? extractOAuthStateParam(callbackUrl) : "";
+    if (cbState) {
+        const idx = _pendingOAuthQueue.findIndex((x) => x.state && x.state === cbState);
+        if (idx >= 0) {
+            const [item] = _pendingOAuthQueue.splice(idx, 1);
+            return item.accountId;
+        }
+    }
+    const head = _pendingOAuthQueue.shift();
+    return head ? head.accountId : "";
+}
 
 // Map<accountId, TabEntry>
 const _tabs = new Map();
@@ -48,6 +126,14 @@ const _accountIdByWc = new WeakMap();
 const _accountIdByWcId = new Map();
 // Map<accountId, Promise> to serialize tab creation per account
 const _openingPromises = new Map();
+// Monotonic operation sequence per accountId to resolve open/close/delete races
+const _tabOpSeq = new Map();
+const bumpTabOpSeq = (id) => {
+    const n = (_tabOpSeq.get(id) || 0) + 1;
+    _tabOpSeq.set(id, n);
+    return n;
+};
+let _creatingWindowPromise = null;
 
 function safeCloseView(view, hostContentView) {
     if (!view) return;
@@ -58,8 +144,12 @@ function safeCloseView(view, hostContentView) {
     }
     try {
         const wc = view.webContents;
+        if (wc) {
+            try { utils.unregisterWindowWebContents?.(_mainWin, wc); } catch {}
+        }
         if (wc && !wc.isDestroyed?.()) {
-            wc.close?.();
+            if (typeof wc.destroy === "function") wc.destroy();
+            else wc.close?.({ waitForBeforeUnload: false });
         }
     } catch {}
 }
@@ -72,6 +162,10 @@ function teardownAllViews(opts = {}) {
     _detachResizeListeners = null;
     if (typeof detach === "function") {
         try { detach(); } catch {}
+    }
+    if (_proxyRefreshTimer) {
+        clearInterval(_proxyRefreshTimer);
+        _proxyRefreshTimer = null;
     }
 
     const win = _mainWin;
@@ -86,6 +180,8 @@ function teardownAllViews(opts = {}) {
     _tabs.clear();
     _tabOrder = [];
     _activeAccountId = "";
+    _pendingActivationAccountId = "";
+    _pendingActivationSeq++;
     _viewMode = "picker";
     _tabBarView = null;
     _pickerView = null;
@@ -116,7 +212,24 @@ function teardownAllViews(opts = {}) {
 }
 
 function closeAllViewsForQuit() {
+    const sessionsToClose = new Set();
+    for (const tab of _tabs.values()) {
+        if (tab?.session && tab.session !== session?.defaultSession) {
+            sessionsToClose.add(tab.session);
+        }
+    }
+    for (const v of [_pickerView, _tabBarView]) {
+        const ses = v?.webContents?.session;
+        if (ses && ses !== session?.defaultSession) {
+            sessionsToClose.add(ses);
+        }
+    }
     teardownAllViews({ isQuit: true, keepMainWinRef: true });
+    return Promise.all(
+        [...sessionsToClose].map((ses) =>
+            Promise.resolve(ses.closeAllConnections?.()).catch(() => {})
+        )
+    );
 }
 
 function getWallpaperEngine() {
@@ -234,9 +347,23 @@ function ensureTabBarOnTop() {
     } catch {}
 }
 
+function resolveOverlaySymbolColor() {
+    try {
+        const cfg = getWallpaperEngine().readAppearanceConfig?.() || {};
+        const rawMode = String(cfg.themeMode || "dark").toLowerCase();
+        if (rawMode === "light") return "#111827";
+        if (rawMode === "system") {
+            const { nativeTheme } = electron;
+            if (nativeTheme && nativeTheme.shouldUseDarkColors === false) return "#111827";
+        }
+    } catch {}
+    return "#f1f5f9";
+}
+
 function updateTitleBarOverlay(symbolColor) {
     if (!hasMainWindow() || utils.isMacOS()) return;
     if (symbolColor) _lastOverlaySymbolColor = symbolColor;
+    else _lastOverlaySymbolColor = resolveOverlaySymbolColor();
     try {
         _mainWin.setTitleBarOverlay({
             color: "#00000000",
@@ -272,16 +399,44 @@ function setTabBarVisible(visible) {
     return _tabBarVisible;
 }
 
+function sanitizeTitleTextForPrivacy(str, hidePaths) {
+    let out = String(str || "");
+    out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "••••@••••");
+    if (hidePaths) {
+        out = out
+            .replace(/([A-Za-z]:[/\\]+Users[/\\]+)([^\\/\s,;:"'<>|]+)/gi, "$1••••")
+            .replace(/(\/(?:home|Users)\/)([^/\s,;:"'<>|]+)/g, "$1••••");
+    }
+    return out;
+}
+
 function updateWindowTitle() {
     if (!hasMainWindow()) return;
-    const wslBadge = wsl.getActiveWslDistro?.() ? ` (WSL: ${wsl.getActiveWslDistro()})` : "";
+    let privacyMode = false;
+    let privacyHidePaths = true;
+    try {
+        const cfg = getWallpaperEngine().readAppearanceConfig?.() || {};
+        privacyMode = Boolean(cfg.privacyMode);
+        if (typeof cfg.privacyHidePaths === "boolean") privacyHidePaths = cfg.privacyHidePaths;
+    } catch {}
+    let wslBadge = wsl.getActiveWslDistro?.() ? ` (WSL: ${wsl.getActiveWslDistro()})` : "";
+    if (privacyMode && privacyHidePaths && wslBadge) {
+        wslBadge = sanitizeTitleTextForPrivacy(wslBadge, true);
+    }
     const baseName = app.getName();
     if (_viewMode === "picker" || !_activeAccountId) {
         _mainWin.setTitle(`${baseName}${wslBadge}`);
         return;
     }
     const acc = agyAccounts.getAccountById(_activeAccountId);
-    const label = acc?.customLabel || acc?.displayName || acc?.email || (_activeAccountId === "default" ? "Primary" : _activeAccountId);
+    let label = acc?.customLabel || acc?.displayName || (!privacyMode ? acc?.email : "") || (_activeAccountId === "default" ? "Primary" : _activeAccountId);
+    if (privacyMode && typeof label === "string") {
+        if (label.includes("@")) {
+            label = _activeAccountId === "default" ? "Primary" : "Account";
+        } else if (privacyHidePaths) {
+            label = sanitizeTitleTextForPrivacy(label, true);
+        }
+    }
     _mainWin.setTitle(`${baseName} — ${label}${wslBadge}`);
 }
 
@@ -296,21 +451,26 @@ function notifyTabVisibility(wc, visible) {
 }
 
 function hideBrowserViewsNotOwnedBy(activeWcId) {
+    let hasVisibleOwned = false;
     try {
         const { wcvBrowserRegistry } = require("./wcvBrowserRegistry");
-        if (!wcvBrowserRegistry || !wcvBrowserRegistry.entries) return;
+        if (!wcvBrowserRegistry || !wcvBrowserRegistry.entries) return false;
         for (const entry of wcvBrowserRegistry.entries.values()) {
             if (!entry || entry.parentWindow !== _mainWin || !entry.view) continue;
             const owned = activeWcId !== null && entry.hubSender?.id === activeWcId;
             if (!owned && entry.visible) {
                 entry._agyHiddenByTabSwitch = true;
                 entry.view.setVisible?.(false);
-            } else if (owned && entry._agyHiddenByTabSwitch) {
-                entry._agyHiddenByTabSwitch = false;
-                if (entry.visible) entry.view.setVisible?.(true);
+            } else if (owned && entry.visible) {
+                if (entry._agyHiddenByTabSwitch) {
+                    entry._agyHiddenByTabSwitch = false;
+                    entry.view.setVisible?.(true);
+                }
+                hasVisibleOwned = true;
             }
         }
     } catch {}
+    return hasVisibleOwned;
 }
 
 function getShellServerBaseUrl() {
@@ -342,7 +502,65 @@ function configureAccountSession(accountId) {
     return ses;
 }
 
+const ISOLATED_PROXY_BYPASS_RULES = "localhost,127.0.0.1";
+let _winIsolation = null;
+const _proxiedSessions = new WeakSet();
+
+function getWinIsolation() {
+    if (_winIsolation === null) {
+        try { _winIsolation = require("./agyWinUserIsolation"); } catch { _winIsolation = false; }
+    }
+    return _winIsolation || null;
+}
+
+/**
+ * Routes an isolated account session through the Antigravity Unlocker 2 local proxy
+ * (loopback LS / local-server traffic bypassed). Reverts to system proxy once the unlocker is off.
+ * Also warms the shared proxy cache used by the isolated LS spawn path.
+ */
+async function applyAccountSessionProxy(ses, accountId, opts = {}) {
+    if (accountId === "default" || !ses || typeof ses.setProxy !== "function") return null;
+    let proxy = null;
+    try { proxy = (await getWinIsolation()?.resolveUnlockerProxy?.(opts)) || null; } catch {}
+    try {
+        if (proxy && proxy.url) {
+            await ses.setProxy({ proxyRules: proxy.url, proxyBypassRules: ISOLATED_PROXY_BYPASS_RULES });
+            _proxiedSessions.add(ses);
+        } else if (_proxiedSessions.has(ses)) {
+            await ses.setProxy({ mode: "system" });
+            _proxiedSessions.delete(ses);
+        }
+    } catch (err) {
+        console.warn(`[TabManager] setProxy failed for [${accountId}]: ${err?.message || err}`);
+    }
+    return proxy;
+}
+
+async function syncAllTabProxies(force = false) {
+    const entries = [..._tabs.entries()].filter(([id, t]) => id !== "default" && t && !t.destroyed && t.session);
+    if (entries.length === 0) return;
+    if (force) {
+        try { await getWinIsolation()?.resolveUnlockerProxy?.({ force: true }); } catch {}
+    }
+    await Promise.all(entries.map(([id, t]) => applyAccountSessionProxy(t.session, id)));
+}
+
 async function createMainTabWindow(storageManager, options = {}) {
+    if (hasMainWindow()) {
+        if (_mainWin.isMinimized()) _mainWin.restore();
+        _mainWin.show();
+        _mainWin.focus();
+        return _mainWin;
+    }
+    if (_creatingWindowPromise) {
+        return _creatingWindowPromise;
+    }
+    _creatingWindowPromise = _createMainTabWindowImpl(storageManager, options)
+        .finally(() => { _creatingWindowPromise = null; });
+    return _creatingWindowPromise;
+}
+
+async function _createMainTabWindowImpl(storageManager, options = {}) {
     if (hasMainWindow()) {
         if (_mainWin.isMinimized()) _mainWin.restore();
         _mainWin.show();
@@ -377,7 +595,7 @@ async function createMainTabWindow(storageManager, options = {}) {
             ? false
             : {
                 color: "#00000000",
-                symbolColor: "#f1f5f9",
+                symbolColor: resolveOverlaySymbolColor(),
                 height: _tabBarVisible ? _tabBarHeight : 32,
             },
         backgroundColor: curtainColor,
@@ -457,13 +675,28 @@ async function createMainTabWindow(storageManager, options = {}) {
     syncAllViewBounds();
 
     const onResize = () => syncAllViewBounds();
+    const onFocusSyncProxy = () => {
+        if (!_isQuitting && _tabs.size > 0) {
+            void syncAllTabProxies(true);
+        }
+    };
     const hostContentView = baseWin.contentView;
     baseWin.on("resize", onResize);
+    baseWin.on("focus", onFocusSyncProxy);
     hostContentView?.on?.("bounds-changed", onResize);
+    if (!_proxyRefreshTimer) {
+        _proxyRefreshTimer = setInterval(() => {
+            if (!_isQuitting && _tabs.size > 0) {
+                void syncAllTabProxies(false);
+            }
+        }, 30000);
+        _proxyRefreshTimer.unref?.();
+    }
     _detachResizeListeners = () => {
         try {
             if (!baseWin.isDestroyed?.()) {
                 baseWin.off?.("resize", onResize);
+                baseWin.off?.("focus", onFocusSyncProxy);
                 hostContentView?.off?.("bounds-changed", onResize);
             }
         } catch {}
@@ -492,14 +725,31 @@ async function createMainTabWindow(storageManager, options = {}) {
     });
 
     baseWin.on("closed", () => {
-        teardownAllViews({ isQuit: _isQuitting, keepMainWinRef: false });
+        if (_mainWin === baseWin) {
+            teardownAllViews({ isQuit: _isQuitting, keepMainWinRef: false });
+        }
     });
 
-    void _tabBarView.webContents.loadURL(`${shellBase}/shell/tabbar`).catch(() => {});
-    void _pickerView.webContents.loadURL(`${shellBase}/shell/picker`).catch(() => {});
+    const wpShellToken = getWallpaperEngine().getShellServerToken?.() || getWallpaperEngine().getLocalServerToken?.() || "";
+    const tokenQs = wpShellToken ? `?t=${encodeURIComponent(wpShellToken)}` : "";
+    void _tabBarView.webContents.loadURL(`${shellBase}/shell/tabbar${tokenQs}`).catch(() => {});
+    void _pickerView.webContents.loadURL(`${shellBase}/shell/picker${tokenQs}`).catch(() => {});
 
-    _viewMode = "picker";
-    _activeAccountId = "";
+    const initialAccountId = typeof options?.initialAccountId === "string" ? options.initialAccountId.trim() : "";
+    _pickerView.webContents.once("did-finish-load", () => {
+        if (_viewMode !== "picker" && !_pickerView?.webContents?.isDestroyed?.()) {
+            notifyTabVisibility(_pickerView.webContents, false);
+        }
+    });
+    if (initialAccountId) {
+        _pickerView.setVisible(false);
+        notifyTabVisibility(_pickerView.webContents, false);
+        _viewMode = "tab";
+        _activeAccountId = initialAccountId;
+    } else {
+        _viewMode = "picker";
+        _activeAccountId = "";
+    }
     updateWindowTitle();
     agyAccounts.emitAccountsChanged("window-ready");
     return baseWin;
@@ -507,6 +757,8 @@ async function createMainTabWindow(storageManager, options = {}) {
 
 function showPicker() {
     if (!hasMainWindow()) return false;
+    _pendingActivationSeq++;
+    _pendingActivationAccountId = "__picker__";
     // Hide currently active account tab & pause its wallpaper video
     if (_viewMode === "tab" && _activeAccountId) {
         const prev = _tabs.get(_activeAccountId);
@@ -521,6 +773,7 @@ function showPicker() {
         _pickerView.setVisible(true);
         notifyTabVisibility(_pickerView.webContents, true);
         utils.setActiveHubViewForWindow(_mainWin, _pickerView, _tabBarVisible ? _tabBarHeight : 0);
+        utils.setHubSurfaceTransparent?.(_mainWin, false);
         try { _pickerView.webContents.focus(); } catch {}
     }
     syncAllViewBounds();
@@ -529,9 +782,16 @@ function showPicker() {
     return true;
 }
 
-function activateTabView(accountId) {
+function activateTabView(accountId, expectedSeq = null) {
     const tab = _tabs.get(accountId);
     if (!hasMainWindow() || !tab || tab.destroyed || !tab.view || tab.view.webContents?.isDestroyed?.()) {
+        return false;
+    }
+    if (
+        expectedSeq !== null &&
+        _pendingActivationSeq !== expectedSeq &&
+        _pendingActivationAccountId !== accountId
+    ) {
         return false;
     }
 
@@ -550,17 +810,25 @@ function activateTabView(accountId) {
 
     _viewMode = "tab";
     _activeAccountId = accountId;
+    _pendingActivationAccountId = accountId;
+    if (expectedSeq === null) {
+        _pendingActivationSeq++;
+    }
     tab.activatedOnce = true;
 
     tab.view.setVisible(true);
     syncAllViewBounds();
     utils.setActiveHubViewForWindow(_mainWin, tab.view, _tabBarVisible ? _tabBarHeight : 0);
-    hideBrowserViewsNotOwnedBy(tab.wcId ?? tab.view.webContents.id);
+    const hasVisibleBrowser = hideBrowserViewsNotOwnedBy(tab.wcId ?? tab.view.webContents.id);
+    utils.setHubSurfaceTransparent?.(_mainWin, hasVisibleBrowser);
     notifyTabVisibility(tab.view.webContents, true);
     try { tab.view.webContents.focus(); } catch {}
 
-    // Retarget active LS pointer, actuator, mendel sync
+    // Retarget active LS pointer, actuator, mendel sync & refresh unlocker proxy
     languageServer.setActiveProfileServer(accountId);
+    if (accountId !== "default" && tab.session) {
+        void applyAccountSessionProxy(tab.session, accountId);
+    }
     if (tab.lsPort > 0 && tab.lsCsrf) {
         try { mainActuator.startMainActuatorClient(tab.lsPort, tab.lsCsrf); } catch {}
         _onActiveLsChanged?.(accountId, tab.lsPort, tab.lsCsrf);
@@ -587,7 +855,7 @@ async function loadTabWithBootstrap(tab, targetUrl) {
     }
 }
 
-async function createAccountTabView(accountId, lsInfo) {
+async function createAccountTabView(accountId, lsInfo, activationSeq = null) {
     const ses = configureAccountSession(accountId);
     const curtainColor = utils.getHubCurtainColor(_mainWin);
     const partition = accountId === "default" ? undefined : `persist:agy_${accountId}`;
@@ -636,9 +904,11 @@ async function createAccountTabView(accountId, lsInfo) {
             return;
         }
         event.preventDefault();
+        recordOAuthInitiator(accountId, event.url);
         void externalUrl.openExternalSafely(event.url, "unconfirmed");
     };
     wc.setWindowOpenHandler((details) => {
+        recordOAuthInitiator(accountId, details.url);
         void externalUrl.openExternalSafely(details.url, "unconfirmed");
         return { action: "deny" };
     });
@@ -677,8 +947,11 @@ async function createAccountTabView(accountId, lsInfo) {
                 const stored = parseFloat(items[ZOOM_KEY]);
                 if (!Number.isNaN(stored) && !tab.destroyed && !wc.isDestroyed?.()) {
                     restoring = true;
-                    wc.setZoomLevel(stored);
-                    restoring = false;
+                    try {
+                        wc.setZoomLevel(stored);
+                    } finally {
+                        restoring = false;
+                    }
                 }
             } catch {}
         });
@@ -716,7 +989,13 @@ async function createAccountTabView(accountId, lsInfo) {
     const activateNow = () => {
         if (activated || tab.destroyed || !hasMainWindow()) return;
         activated = true;
-        activateTabView(accountId);
+        if (_pendingActivationAccountId && _pendingActivationAccountId !== accountId) {
+            return;
+        }
+        if (activationSeq !== null && _pendingActivationSeq !== activationSeq && _pendingActivationAccountId !== accountId) {
+            return;
+        }
+        activateTabView(accountId, activationSeq);
     };
     wc.once("dom-ready", activateNow);
     const fallbackTimer = setTimeout(activateNow, 1500);
@@ -728,13 +1007,33 @@ async function createAccountTabView(accountId, lsInfo) {
 
 async function openOrActivateAccount(accountId) {
     const id = String(accountId || "").trim().toLowerCase() || "default";
+    const existing = _tabs.get(id);
+    if (existing && !existing.destroyed && existing.view && !existing.view.webContents?.isDestroyed?.()) {
+        if (!hasMainWindow()) {
+            await createMainTabWindow(_storageManager);
+        }
+        const seqNow = ++_pendingActivationSeq;
+        _pendingActivationAccountId = id;
+        activateTabView(id, seqNow);
+        return { ok: true, reused: true, accountId: id };
+    }
+
+    let initialAcc = agyAccounts.getAccountById(id);
+    if (!initialAcc) {
+        if (hasMainWindow() && getOpenAccountIds().length === 0) showPicker();
+        return { ok: false, error: "not_found", message: "Account not found" };
+    }
+
+    const activationSeq = ++_pendingActivationSeq;
+    _pendingActivationAccountId = id;
+
     if (!hasMainWindow()) {
         await createMainTabWindow(_storageManager);
     }
 
-    const existing = _tabs.get(id);
-    if (existing && !existing.destroyed && existing.view && !existing.view.webContents?.isDestroyed?.()) {
-        activateTabView(id);
+    const existingAfterWin = _tabs.get(id);
+    if (existingAfterWin && !existingAfterWin.destroyed && existingAfterWin.view && !existingAfterWin.view.webContents?.isDestroyed?.()) {
+        activateTabView(id, activationSeq);
         return { ok: true, reused: true, accountId: id };
     }
 
@@ -743,8 +1042,11 @@ async function openOrActivateAccount(accountId) {
     }
 
     const openPromise = (async () => {
-        let acc = agyAccounts.getAccountById(id);
+        const seq = bumpTabOpSeq(id);
+        let acc = agyAccounts.getAccountById(id) || initialAcc;
         if (!acc) {
+            if (_pendingActivationSeq === activationSeq) _pendingActivationAccountId = _activeAccountId;
+            if (getOpenAccountIds().length === 0 && hasMainWindow()) showPicker();
             return { ok: false, error: "not_found", message: "Account not found" };
         }
 
@@ -752,34 +1054,56 @@ async function openOrActivateAccount(accountId) {
         if (id !== "default" && process.platform === "win32" && !acc.isolationReady) {
             agyAccounts.updateRuntimeState(id, { status: "starting", lastError: "" });
             const rep = await agyAccounts.repairAccountIsolation(id);
+            if (_tabOpSeq.get(id) !== seq || _isQuitting) {
+                return { ok: false, error: "cancelled", message: "Tab operation superseded" };
+            }
             if (!rep.ok) {
+                if (_pendingActivationSeq === activationSeq) _pendingActivationAccountId = _activeAccountId;
                 agyAccounts.updateRuntimeState(id, { status: "error", lastError: rep.message || rep.error || "Provision failed" });
+                if (getOpenAccountIds().length === 0 && hasMainWindow()) showPicker();
                 return { ok: false, error: rep.error || "winuser_provision_failed", message: rep.message || "Windows isolation setup failed" };
             }
             acc = agyAccounts.getAccountById(id);
         }
 
         agyAccounts.updateRuntimeState(id, { status: "starting", lastError: "" });
-        // Pre-configure session, local cert trust, and CSP before LS finishes booting
-        try { configureAccountSession(id); } catch {}
+        // Pre-configure session, local cert trust, CSP and unlocker proxy before LS finishes booting
+        try {
+            const preSes = configureAccountSession(id);
+            await applyAccountSessionProxy(preSes, id);
+        } catch {}
 
         try {
             const lsInfo = await languageServer.ensureProfileServer(id, {
                 winUser: acc?.winUser || "",
                 geminiDir: acc?.geminiDir || "",
             });
-            if (!hasMainWindow() || _isQuitting) {
+            if (!hasMainWindow() || _isQuitting || _tabOpSeq.get(id) !== seq) {
+                return { ok: false, error: "cancelled", message: "Window closed or tab closed while starting" };
+            }
+            const created = await createAccountTabView(id, lsInfo, activationSeq);
+            if (!created) {
+                if (getOpenAccountIds().length === 0 && hasMainWindow()) showPicker();
                 return { ok: false, error: "window_closed", message: "Window was closed" };
             }
-            const created = await createAccountTabView(id, lsInfo);
-            if (!created) {
-                return { ok: false, error: "window_closed", message: "Window was closed" };
+            if (_tabOpSeq.get(id) !== seq || _isQuitting) {
+                // Close arrived during createAccountTabView; tear down immediately without resurrecting tab
+                created.destroyed = true;
+                _tabs.delete(id);
+                _tabOrder = _tabOrder.filter((x) => x !== id);
+                if (typeof created.wcId === "number") _accountIdByWcId.delete(created.wcId);
+                let hostCv = null;
+                try { hostCv = hasMainWindow() ? _mainWin.contentView : null; } catch {}
+                safeCloseView(created.view, hostCv);
+                return { ok: false, error: "cancelled", message: "Tab closed while loading" };
             }
             return { ok: true, reused: false, accountId: id, port: lsInfo.port };
         } catch (err) {
+            if (_pendingActivationSeq === activationSeq) _pendingActivationAccountId = _activeAccountId;
             const msg = String(err?.message || err);
             console.error(`[TabManager] Failed to open account [${id}]:`, msg);
             agyAccounts.updateRuntimeState(id, { tabOpen: false, status: "error", lastError: msg });
+            if (getOpenAccountIds().length === 0 && hasMainWindow()) showPicker();
             return { ok: false, error: "profile_start_failed", message: msg };
         }
     })().finally(() => {
@@ -792,6 +1116,7 @@ async function openOrActivateAccount(accountId) {
 
 async function closeAccountTab(accountId, opts = {}) {
     const id = String(accountId || "").trim().toLowerCase();
+    const seq = bumpTabOpSeq(id);
     let defaultStop = true;
     try {
         const _wpClose = getWallpaperEngine();
@@ -824,6 +1149,9 @@ async function closeAccountTab(accountId, opts = {}) {
         try {
             await languageServer.stopProfileServer(id, { allowActive: true });
         } catch {}
+        if (_tabOpSeq.get(id) !== seq) {
+            return { ok: true, closed: id, superseded: true };
+        }
         agyAccounts.updateRuntimeState(id, {
             tabOpen: false,
             status: "stopped",
@@ -842,6 +1170,10 @@ async function closeAccountTab(accountId, opts = {}) {
             activateTabView(remaining[remaining.length - 1]);
         } else {
             _activeAccountId = "";
+            if (stopServer) {
+                try { mainActuator.stopMainActuatorClient?.(); } catch {}
+                try { _onActiveLsChanged?.("", 0, ""); } catch {}
+            }
             showPicker();
         }
     } else {
@@ -937,6 +1269,7 @@ module.exports = {
     setTabBarHeight,
     setTabBarVisible,
     updateTitleBarOverlay,
+    updateWindowTitle,
     getAccountIdForWebContents,
     getTabWebContents,
     getAllTabWebContents,
@@ -952,4 +1285,8 @@ module.exports = {
     handleInstanceExited,
     focusAccountTabForNotification,
     syncAllViewBounds,
+    recordOAuthInitiator,
+    peekOAuthInitiator,
+    consumeOAuthInitiator,
+    applyAccountSessionProxy,
 };

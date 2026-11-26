@@ -1,6 +1,9 @@
 "use strict";
 const https = require("https");
 const http = require("http");
+const net = require("net");
+const dns = require("dns");
+const { fileURLToPath } = require("url");
 const crypto = require("crypto");
 const readline = require("readline");
 const { spawn, execFile } = require("child_process");
@@ -11,9 +14,42 @@ const path = require("path");
 let appRef = null;
 try { appRef = require("electron").app; } catch {}
 
-const lyricsCache = new Map();
+const lyricsCache = new Map(); // key -> { val: object, ts: number }
+const lyricsInFlight = new Map(); // key -> Promise<object>
+const MAX_LYRICS_CACHE = 100;
+const LYRICS_MISS_TTL_MS = 30 * 1000;
 const coverCache = new Map(); // coverKey -> { buf: Buffer, mime: string, hires: boolean }
 const coverInFlight = new Set();
+
+function isValidMprisTarget(target) {
+    return typeof target === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(target);
+}
+
+function isValidDbusObjectPath(trackId) {
+    return typeof trackId === "string" && /^\/[A-Za-z0-9_\/.-]{1,256}$/.test(trackId);
+}
+
+function getLyricsCached(key, now = Date.now()) {
+    const entry = lyricsCache.get(key);
+    if (!entry) return null;
+    if (!entry.val.found && (now - entry.ts) > LYRICS_MISS_TTL_MS) {
+        lyricsCache.delete(key);
+        return null;
+    }
+    // LRU touch
+    lyricsCache.delete(key);
+    lyricsCache.set(key, entry);
+    return entry.val;
+}
+
+function setLyricsCached(key, val, now = Date.now()) {
+    if (lyricsCache.has(key)) lyricsCache.delete(key);
+    lyricsCache.set(key, { val, ts: now });
+    while (lyricsCache.size > MAX_LYRICS_CACHE) {
+        const oldestKey = lyricsCache.keys().next().value;
+        lyricsCache.delete(oldestKey);
+    }
+}
 
 let lastSmtcKey = "";
 let lastSmtcBuf = null;
@@ -514,75 +550,280 @@ while ($true) {
 }
 `;
 
-function httpsGetJson(url, timeoutMs = 4500) {
+function strictDetectImageMime(buf) {
+    if (!buf || buf.length < 16) return null;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+    if (buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+    const gifSig = buf.subarray(0, 6).toString("ascii");
+    if (gifSig === "GIF87a" || gifSig === "GIF89a") return "image/gif";
+    return null;
+}
+
+function expandIpv6Hextets(ip) {
+    let s = String(ip || "").trim().toLowerCase();
+    if (!s) return null;
+    if (s.includes(".")) {
+        const lastColon = s.lastIndexOf(":");
+        if (lastColon < 0) return null;
+        const ipv4Part = s.slice(lastColon + 1);
+        if (!net.isIPv4(ipv4Part)) return null;
+        const octets = ipv4Part.split(".").map((n) => parseInt(n, 10));
+        if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+        const hHigh = ((octets[0] << 8) | octets[1]).toString(16);
+        const hLow = ((octets[2] << 8) | octets[3]).toString(16);
+        s = s.slice(0, lastColon + 1) + hHigh + ":" + hLow;
+    }
+    const doubleColonParts = s.split("::");
+    if (doubleColonParts.length > 2) return null;
+    let groups;
+    if (doubleColonParts.length === 2) {
+        const left = doubleColonParts[0] ? doubleColonParts[0].split(":") : [];
+        const right = doubleColonParts[1] ? doubleColonParts[1].split(":") : [];
+        const fillCount = 8 - (left.length + right.length);
+        if (fillCount < 1) return null;
+        groups = [...left, ...new Array(fillCount).fill("0"), ...right];
+    } else {
+        groups = s.split(":");
+    }
+    if (groups.length !== 8) return null;
+    const nums = [];
+    for (const g of groups) {
+        if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+        nums.push(parseInt(g, 16));
+    }
+    return nums;
+}
+
+function hextetsToIpv4(hHi, hLo) {
+    return `${(hHi >> 8) & 0xff}.${hHi & 0xff}.${(hLo >> 8) & 0xff}.${hLo & 0xff}`;
+}
+
+function isPrivateOrReservedIp(rawIp) {
+    let ip = String(rawIp || "").trim().toLowerCase();
+    if (!ip) return true;
+    if (ip.startsWith("[") && ip.endsWith("]")) ip = ip.slice(1, -1);
+    const zoneIdx = ip.indexOf("%");
+    if (zoneIdx >= 0) ip = ip.slice(0, zoneIdx);
+
+    if (ip.startsWith("::ffff:")) {
+        const mapped = ip.slice(7);
+        if (net.isIPv4(mapped)) return isPrivateOrReservedIp(mapped);
+    }
+
+    if (net.isIPv4(ip)) {
+        const parts = ip.split(".").map((n) => parseInt(n, 10));
+        if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+        const [a, b] = parts;
+        if (a === 0 || a === 10 || a === 127) return true;
+        if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+        if (a === 169 && b === 254) return true; // Link-local / metadata
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        if (a === 192 && b === 168) return true;
+        if (a >= 224) return true; // Multicast & reserved
+        return false;
+    }
+
+    if (net.isIPv6(ip)) {
+        const hextets = expandIpv6Hextets(ip);
+        if (!hextets) return true;
+        const isAllZeroPrefix = hextets[0] === 0 && hextets[1] === 0 && hextets[2] === 0 && hextets[3] === 0;
+        // IPv4-mapped ::ffff:a.b.c.d / ::ffff:XXXX:XXXX and IPv4-translated ::ffff:0:a.b.c.d
+        if (isAllZeroPrefix && hextets[4] === 0 && hextets[5] === 0xffff) {
+            return isPrivateOrReservedIp(hextetsToIpv4(hextets[6], hextets[7]));
+        }
+        if (isAllZeroPrefix && hextets[4] === 0xffff && hextets[5] === 0) {
+            return isPrivateOrReservedIp(hextetsToIpv4(hextets[6], hextets[7]));
+        }
+        // Unspecified ::, loopback ::1, and deprecated IPv4-compatible ::a.b.c.d
+        if (isAllZeroPrefix && hextets[4] === 0 && hextets[5] === 0) {
+            if (hextets[6] === 0 && hextets[7] <= 1) return true;
+            return isPrivateOrReservedIp(hextetsToIpv4(hextets[6], hextets[7]));
+        }
+        // NAT64 well-known prefixes (64:ff9b::/96 and 64:ff9b:1::/48)
+        if (hextets[0] === 0x0064 && hextets[1] === 0xff9b && (hextets[2] === 0 || hextets[2] === 1)) {
+            return isPrivateOrReservedIp(hextetsToIpv4(hextets[6], hextets[7]));
+        }
+        const h0 = hextets[0];
+        if ((h0 & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
+        if ((h0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+        if ((h0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+        return false;
+    }
+
+    return true;
+}
+
+function isSafePublicArtUrl(urlStr) {
+    try {
+        const parsed = new URL(String(urlStr || ""));
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+        let host = parsed.hostname.toLowerCase();
+        if (!host) return false;
+        if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+        if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+            return false;
+        }
+        if (net.isIP(host)) {
+            return !isPrivateOrReservedIp(host);
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function resolvePublicHost(hostname) {
+    let host = String(hostname || "").trim().toLowerCase();
+    if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+    if (!host) return null;
+    if (net.isIP(host)) {
+        if (isPrivateOrReservedIp(host)) return null;
+        return { address: host, family: net.isIPv6(host) ? 6 : 4 };
+    }
+    try {
+        const addrs = await dns.promises.lookup(host, { all: true, verbatim: true });
+        if (!Array.isArray(addrs) || addrs.length === 0) return null;
+        for (const a of addrs) {
+            if (!a || !a.address || isPrivateOrReservedIp(a.address)) return null;
+        }
+        return { address: addrs[0].address, family: addrs[0].family || (net.isIPv6(addrs[0].address) ? 6 : 4) };
+    } catch {
+        return null;
+    }
+}
+
+async function resolvePinnedPublicUrl(urlStr, { httpsOnly = false } = {}) {
+    if (!isSafePublicArtUrl(urlStr)) return null;
+    let parsed;
+    try { parsed = new URL(String(urlStr || "")); } catch { return null; }
+    if (httpsOnly && parsed.protocol !== "https:") return null;
+    const resolved = await resolvePublicHost(parsed.hostname);
+    if (!resolved) return null;
+    const pinnedLookup = (_hostname, options, cb) => {
+        if (typeof options === "function") {
+            options(null, resolved.address, resolved.family);
+            return;
+        }
+        if (options && options.all) {
+            cb(null, [{ address: resolved.address, family: resolved.family }]);
+            return;
+        }
+        cb(null, resolved.address, resolved.family);
+    };
+    return { parsed, pinnedLookup };
+}
+
+async function httpsGetJson(url, timeoutMs = 4500, redirectsLeft = 3) {
+    const target = await resolvePinnedPublicUrl(url, { httpsOnly: true });
+    if (!target) return null;
+    const { parsed, pinnedLookup } = target;
     return new Promise((resolve) => {
-        const req = https.get(
-            url,
-            {
-                timeout: timeoutMs,
-                headers: {
-                    "User-Agent": "AntigravityPlayer/2.1",
-                    Accept: "application/json",
+        let done = false;
+        const finish = (val) => { if (done) return; done = true; resolve(val); };
+        let req;
+        try {
+            req = https.get(
+                parsed,
+                {
+                    timeout: timeoutMs,
+                    lookup: pinnedLookup,
+                    headers: {
+                        "User-Agent": "AntigravityPlayer/2.1",
+                        Accept: "application/json",
+                    },
                 },
-            },
-            (res) => {
-                if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                    res.resume();
-                    httpsGetJson(res.headers.location, timeoutMs).then(resolve);
-                    return;
+                (res) => {
+                    if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume();
+                        if (redirectsLeft <= 0) { finish(null); return; }
+                        try {
+                            const nextUrl = new URL(res.headers.location, parsed).toString();
+                            httpsGetJson(nextUrl, timeoutMs, redirectsLeft - 1).then(finish);
+                        } catch { finish(null); }
+                        return;
+                    }
+                    if (res.statusCode !== 200) {
+                        res.resume();
+                        finish(null);
+                        return;
+                    }
+                    const chunks = [];
+                    let total = 0;
+                    res.on("data", (c) => {
+                        const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+                        total += b.length;
+                        if (total > 1024 * 1024) { req.destroy(); finish(null); return; }
+                        chunks.push(b);
+                    });
+                    res.on("error", () => finish(null));
+                    res.on("end", () => {
+                        try { finish(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { finish(null); }
+                    });
                 }
-                if (res.statusCode && res.statusCode >= 400) {
-                    res.resume();
-                    resolve(null);
-                    return;
-                }
-                let body = "";
-                res.on("data", (c) => {
-                    body += c;
-                    if (body.length > 1024 * 1024) req.destroy();
-                });
-                res.on("end", () => {
-                    try { resolve(JSON.parse(body)); } catch { resolve(null); }
-                });
-            }
-        );
-        req.on("error", () => resolve(null));
-        req.on("timeout", () => { req.destroy(); resolve(null); });
+            );
+        } catch {
+            finish(null);
+            return;
+        }
+        req.on("error", () => finish(null));
+        req.on("timeout", () => { req.destroy(); finish(null); });
     });
 }
 
-function httpsGetBuffer(url, timeoutMs = 5000) {
+async function httpsGetBuffer(url, timeoutMs = 5000, redirectsLeft = 3) {
+    const target = await resolvePinnedPublicUrl(url, { httpsOnly: true });
+    if (!target) return null;
+    const { parsed, pinnedLookup } = target;
     return new Promise((resolve) => {
-        const req = https.get(
-            url,
-            { timeout: timeoutMs, headers: { "User-Agent": "AntigravityPlayer/2.1" } },
-            (res) => {
-                if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                    res.resume();
-                    httpsGetBuffer(res.headers.location, timeoutMs).then(resolve);
-                    return;
+        let done = false;
+        const finish = (val) => { if (done) return; done = true; resolve(val); };
+        let req;
+        try {
+            req = https.get(
+                parsed,
+                {
+                    timeout: timeoutMs,
+                    lookup: pinnedLookup,
+                    headers: { "User-Agent": "AntigravityPlayer/2.1" },
+                },
+                (res) => {
+                    if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume();
+                        if (redirectsLeft <= 0) { finish(null); return; }
+                        try {
+                            const nextUrl = new URL(res.headers.location, parsed).toString();
+                            httpsGetBuffer(nextUrl, timeoutMs, redirectsLeft - 1).then(finish);
+                        } catch { finish(null); }
+                        return;
+                    }
+                    if (res.statusCode !== 200) {
+                        res.resume();
+                        finish(null);
+                        return;
+                    }
+                    const chunks = [];
+                    let total = 0;
+                    res.on("data", (c) => {
+                        const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+                        total += b.length;
+                        if (total > 6 * 1024 * 1024) { req.destroy(); finish(null); return; }
+                        chunks.push(b);
+                    });
+                    res.on("error", () => finish(null));
+                    res.on("end", () => {
+                        const buf = Buffer.concat(chunks);
+                        const mime = strictDetectImageMime(buf);
+                        finish(buf.length > 2000 && mime ? { buf, mime } : null);
+                    });
                 }
-                if (res.statusCode && res.statusCode >= 400) {
-                    res.resume();
-                    resolve(null);
-                    return;
-                }
-                const chunks = [];
-                let total = 0;
-                res.on("data", (c) => {
-                    total += c.length;
-                    if (total > 6 * 1024 * 1024) { req.destroy(); resolve(null); return; }
-                    chunks.push(c);
-                });
-                res.on("end", () => {
-                    const buf = Buffer.concat(chunks);
-                    const ct = String(res.headers["content-type"] || "image/jpeg").split(";")[0].trim();
-                    resolve(buf.length > 2000 ? { buf, mime: ct.startsWith("image/") ? ct : "image/jpeg" } : null);
-                });
-            }
-        );
-        req.on("error", () => resolve(null));
-        req.on("timeout", () => { req.destroy(); resolve(null); });
+            );
+        } catch {
+            finish(null);
+            return;
+        }
+        req.on("error", () => finish(null));
+        req.on("timeout", () => { req.destroy(); finish(null); });
     });
 }
 
@@ -682,6 +923,7 @@ class MediaDaemon {
         this.proc = null;
         this.ready = false;
         this.starting = null;
+        this._startSettle = null;
         this.startError = "";
         this.scriptLocation = null;
         this.pending = new Map();
@@ -698,10 +940,15 @@ class MediaDaemon {
         this.starting = starting;
 
         let child = null;
+        let rl = null;
         let readyTimer = null;
         let cleaned = false;
         let scriptLocation = null;
-        const settle = () => resolveStart();
+        const settle = () => {
+            if (this._startSettle === settle) this._startSettle = null;
+            resolveStart();
+        };
+        this._startSettle = settle;
         const cleanupScript = () => {
             if (!scriptLocation) return;
             removeDaemonScriptFile(scriptLocation);
@@ -713,7 +960,18 @@ class MediaDaemon {
         const cleanup = (error = "daemon_exited") => {
             if (cleaned) return;
             cleaned = true;
-            if (readyTimer) clearTimeout(readyTimer);
+            const timerRef = readyTimer;
+            readyTimer = null;
+            if (timerRef) {
+                clearTimeout(timerRef);
+                if (this._readyTimer === timerRef) this._readyTimer = null;
+            }
+            const rlRef = rl;
+            rl = null;
+            if (rlRef) {
+                try { rlRef.close(); } catch {}
+                if (this._rl === rlRef) this._rl = null;
+            }
             cleanupScript();
             this.ready = false;
             this.startError = error || "daemon_exited";
@@ -739,7 +997,9 @@ class MediaDaemon {
             this.ready = false;
             this.startError = "";
 
-            const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+            child.stdin?.on?.("error", () => {});
+            rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+            this._rl = rl;
             if (child.stderr) child.stderr.on("data", () => {});
             readyTimer = setTimeout(() => {
                 if (this.ready) return;
@@ -747,6 +1007,7 @@ class MediaDaemon {
                 try { if (child && !child.killed) child.kill(); } catch {}
                 cleanup("startup_timeout");
             }, 8000);
+            this._readyTimer = readyTimer;
 
             rl.on("line", (line) => {
                 const trimmed = (line || "").trim();
@@ -754,7 +1015,12 @@ class MediaDaemon {
                 let msg;
                 try { msg = JSON.parse(trimmed); } catch { return; }
                 if (msg.ready) {
-                    if (readyTimer) clearTimeout(readyTimer);
+                    const timerRef = readyTimer;
+                    readyTimer = null;
+                    if (timerRef) {
+                        clearTimeout(timerRef);
+                        if (this._readyTimer === timerRef) this._readyTimer = null;
+                    }
                     this.ready = true;
                     this.startError = "";
                     if (this.starting === starting) this.starting = null;
@@ -813,6 +1079,17 @@ class MediaDaemon {
         if (!force && this.lastStatus.data && now - this.lastStatus.ts < 650) {
             return this.lastStatus.data;
         }
+        if (!force && this._statusInFlight) {
+            return this._statusInFlight;
+        }
+        const p = this._fetchStatusInternal().finally(() => {
+            if (this._statusInFlight === p) this._statusInFlight = null;
+        });
+        this._statusInFlight = p;
+        return p;
+    }
+
+    async _fetchStatusInternal() {
         const resp = await this.send({
             cmd: "status",
             app: pinnedAppId || "",
@@ -922,6 +1199,19 @@ class MediaDaemon {
     }
 
     dispose() {
+        if (this._readyTimer) {
+            clearTimeout(this._readyTimer);
+            this._readyTimer = null;
+        }
+        if (this._rl) {
+            try { this._rl.close(); } catch {}
+            this._rl = null;
+        }
+        for (const [, entry] of this.pending) {
+            clearTimeout(entry.timer);
+            entry.resolve({ ok: false, error: "disposed" });
+        }
+        this.pending.clear();
         try {
             if (this.proc && !this.proc.killed) this.proc.kill();
         } catch {}
@@ -929,6 +1219,13 @@ class MediaDaemon {
         if (this.scriptLocation && !fs.existsSync(this.scriptLocation.directory)) this.scriptLocation = null;
         this.proc = null;
         this.ready = false;
+        this.starting = null;
+        if (!this.startError) this.startError = "disposed";
+        if (typeof this._startSettle === "function") {
+            const settle = this._startSettle;
+            this._startSettle = null;
+            settle();
+        }
     }
 }
 
@@ -1003,39 +1300,63 @@ function detectImageMime(buf) {
     return "image/jpeg";
 }
 
-function httpOrHttpsGetBuffer(urlStr, timeoutMs = 4500) {
-    if (String(urlStr || "").startsWith("https://")) {
-        return httpsGetBuffer(urlStr, timeoutMs);
+async function httpOrHttpsGetBuffer(urlStr, timeoutMs = 4500, redirectsLeft = 3) {
+    const target = await resolvePinnedPublicUrl(urlStr);
+    if (!target) {
+        return null;
     }
-    if (!String(urlStr || "").startsWith("http://")) {
-        return Promise.resolve(null);
-    }
+    const { parsed, pinnedLookup } = target;
+    const client = parsed.protocol === "https:" ? https : http;
+
     return new Promise((resolve) => {
-        const req = http.get(urlStr, { timeout: timeoutMs }, (res) => {
-            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                res.resume();
-                httpOrHttpsGetBuffer(res.headers.location, timeoutMs).then(resolve);
-                return;
-            }
-            if (res.statusCode && res.statusCode >= 400) {
-                res.resume();
-                resolve(null);
-                return;
-            }
-            const chunks = [];
-            let total = 0;
-            res.on("data", (c) => {
-                total += c.length;
-                if (total > 6 * 1024 * 1024) { req.destroy(); resolve(null); return; }
-                chunks.push(c);
-            });
-            res.on("end", () => {
-                const buf = Buffer.concat(chunks);
-                resolve(buf.length > 256 ? { buf, mime: detectImageMime(buf) } : null);
-            });
-        });
-        req.on("error", () => resolve(null));
-        req.on("timeout", () => { req.destroy(); resolve(null); });
+        let done = false;
+        const finish = (val) => { if (done) return; done = true; resolve(val); };
+        let req;
+        try {
+            req = client.get(
+                parsed,
+                {
+                    timeout: timeoutMs,
+                    lookup: pinnedLookup,
+                    headers: { "User-Agent": "AntigravityPlayer/2.1" },
+                },
+                (res) => {
+                    if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume();
+                        if (redirectsLeft <= 0) { finish(null); return; }
+                        try {
+                            const nextUrl = new URL(res.headers.location, parsed).toString();
+                            httpOrHttpsGetBuffer(nextUrl, timeoutMs, redirectsLeft - 1).then(finish);
+                        } catch { finish(null); }
+                        return;
+                    }
+                    if (res.statusCode !== 200) {
+                        res.resume();
+                        finish(null);
+                        return;
+                    }
+                    const chunks = [];
+                    let total = 0;
+                    res.on("data", (c) => {
+                        const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+                        total += b.length;
+                        if (total > 6 * 1024 * 1024) { req.destroy(); finish(null); return; }
+                        chunks.push(b);
+                    });
+                    res.on("error", () => finish(null));
+                    res.on("end", () => {
+                        const buf = Buffer.concat(chunks);
+                        const mime = strictDetectImageMime(buf);
+                        finish(buf.length > 64 && mime ? { buf, mime } : null);
+                    });
+                }
+            );
+        } catch {
+            finish(null);
+            return;
+        }
+        req.on("error", () => finish(null));
+        req.on("timeout", () => { req.destroy(); finish(null); });
     });
 }
 
@@ -1154,7 +1475,8 @@ class LinuxMediaDaemon {
         ].join(sep);
 
         await Promise.all(names.map(async (player) => {
-            const meta = await runCmdLinux("playerctl", ["-p", player, "metadata", "--format", fmt], 1500);
+            if (!isValidMprisTarget(player)) return;
+            const meta = await runCmdLinux("playerctl", ["-p", player, "--format", fmt, "--", "metadata"], 1500);
             if (!meta.ok) return;
             const parts = meta.stdout.replace(/\r?\n$/, "").split(sep);
             const status = (parts[0] || "Stopped").trim();
@@ -1324,21 +1646,27 @@ class LinuxMediaDaemon {
         if (!artUrl || coverCache.has(coverHash) || this._artInFlight.has(coverHash)) return;
         if (artUrl.startsWith("file://")) {
             try {
-                const filePath = decodeURIComponent(artUrl.replace(/^file:\/\//, ""));
-                if (fs.existsSync(filePath)) {
-                    const buf = fs.readFileSync(filePath);
-                    if (buf && buf.length > 64 && buf.length < 6 * 1024 * 1024) {
-                        coverCache.set(coverHash, { buf, mime: detectImageMime(buf), hires: false });
+                const filePath = fileURLToPath(artUrl);
+                if (/^\/(?:proc|sys|dev|etc)(?:\/|$)/.test(filePath)) return;
+                const st = fs.lstatSync(filePath);
+                if (!st.isFile() || st.size <= 64 || st.size >= 6 * 1024 * 1024) return;
+                this._artInFlight.add(coverHash);
+                void fs.promises.readFile(filePath).then((buf) => {
+                    const mime = strictDetectImageMime(buf);
+                    if (mime && !coverCache.has(coverHash)) {
+                        coverCache.set(coverHash, { buf, mime, hires: false });
                         pruneCoverCache();
                     }
-                }
+                }).catch(() => {}).finally(() => {
+                    this._artInFlight.delete(coverHash);
+                });
             } catch {}
             return;
         }
-        if (artUrl.startsWith("http://") || artUrl.startsWith("https://")) {
+        if (isSafePublicArtUrl(artUrl)) {
             this._artInFlight.add(coverHash);
             void httpOrHttpsGetBuffer(artUrl, 4000).then((img) => {
-                if (img && img.buf && !coverCache.has(coverHash)) {
+                if (img && img.buf && img.mime && !coverCache.has(coverHash)) {
                     coverCache.set(coverHash, { buf: img.buf, mime: img.mime, hires: false });
                     pruneCoverCache();
                 }
@@ -1353,6 +1681,17 @@ class LinuxMediaDaemon {
         if (!force && this.lastStatus.data && now - this.lastStatus.ts < 650) {
             return this.lastStatus.data;
         }
+        if (!force && this._statusInFlight) {
+            return this._statusInFlight;
+        }
+        const p = this._fetchLinuxStatusInternal().finally(() => {
+            if (this._statusInFlight === p) this._statusInFlight = null;
+        });
+        this._statusInFlight = p;
+        return p;
+    }
+
+    async _fetchLinuxStatusInternal() {
         const backend = await this._detectMprisBackend();
         if (backend === "none") {
             const empty = { sessions: [] };
@@ -1439,6 +1778,10 @@ class LinuxMediaDaemon {
             this.lastStatus.ts = 0;
             return { ok: false, error: "no_media_session" };
         }
+        if (!isValidMprisTarget(target)) {
+            this.lastStatus.ts = 0;
+            return { ok: false, error: "invalid_target" };
+        }
         const backend = await this._detectMprisBackend();
         let res = { ok: false };
 
@@ -1460,14 +1803,15 @@ class LinuxMediaDaemon {
                     "--method", `org.mpris.MediaPlayer2.Player.${methodMap[cmd]}`,
                 ], 1500);
             } else if (cmd === "seek") {
-                const trackId = this._trackIdByPlayer.get(busName) || "/org/mpris/MediaPlayer2/TrackList/NoTrack";
+                const rawTrackId = this._trackIdByPlayer.get(busName) || "";
+                const trackId = isValidDbusObjectPath(rawTrackId) ? rawTrackId : "/org/mpris/MediaPlayer2/TrackList/NoTrack";
                 const sec = Math.max(0, Number(extra.sec) || 0);
                 const usec = Math.round(sec * 1e6);
                 res = await runCmdLinux("gdbus", [
                     "call", "--session", "--dest", busName,
                     "--object-path", "/org/mpris/MediaPlayer2",
                     "--method", "org.mpris.MediaPlayer2.Player.SetPosition",
-                    trackId, String(usec),
+                    "--", trackId, String(usec),
                 ], 1500);
             }
         }
@@ -1515,7 +1859,7 @@ const daemon = process.platform === "win32"
     ? new MediaDaemon()
     : (process.platform === "linux" ? new LinuxMediaDaemon() : new NoopMediaDaemon());
 if (appRef && typeof appRef.on === "function") {
-    appRef.on("before-quit", () => daemon.dispose());
+    appRef.on("will-quit", () => daemon.dispose());
 }
 
 async function fetchLyrics(artist, title, durationSec = 0) {
@@ -1524,94 +1868,103 @@ async function fetchLyrics(artist, title, durationSec = 0) {
     const dur = Number(durationSec) > 0 ? Math.round(Number(durationSec)) : 0;
     const key = (rawArtist + "||" + rawTitle).toLowerCase();
     if (!rawTitle) return { synced: "", plain: "", found: false };
-    if (lyricsCache.has(key)) return lyricsCache.get(key);
+    const cachedLyrics = getLyricsCached(key);
+    if (cachedLyrics) return cachedLyrics;
+    if (lyricsInFlight.has(key)) return lyricsInFlight.get(key);
 
-    const params = new URLSearchParams({ artist_name: rawArtist, track_name: rawTitle });
-    if (dur > 0) params.set("duration", String(dur));
-    let exact = await httpsGetJson("https://lrclib.net/api/get?" + params.toString());
-    if (exact && (exact.syncedLyrics || exact.plainLyrics)) {
-        const res = {
-            synced: exact.syncedLyrics || "",
-            plain: exact.plainLyrics || "",
-            trackName: exact.trackName || rawTitle,
-            artistName: exact.artistName || rawArtist,
-            found: true,
-        };
-        lyricsCache.set(key, res);
-        return res;
-    }
-
-    const cleanTitle = cleanTrackString(rawTitle) || rawTitle;
-    const mainArtist = primaryArtist(rawArtist);
-    const queries = [];
-    if (mainArtist) queries.push(mainArtist + " " + cleanTitle);
-    if (cleanTitle !== rawTitle && rawArtist) queries.push(rawArtist + " " + cleanTitle);
-    queries.push(cleanTitle);
-
-    const seenQueries = new Set();
-    let bestPlain = null;
-    for (const q of queries) {
-        const qNorm = q.trim().toLowerCase();
-        if (!qNorm || seenQueries.has(qNorm)) continue;
-        seenQueries.add(qNorm);
-
-        const list = await httpsGetJson("https://lrclib.net/api/search?q=" + encodeURIComponent(q.trim()));
-        if (!Array.isArray(list) || !list.length) continue;
-
-        const scored = list
-            .filter((item) => item && (item.syncedLyrics || item.plainLyrics))
-            .map((item) => {
-                let score = 0;
-                if (item.syncedLyrics) score += 60;
-                if (item.plainLyrics) score += 10;
-                const itTitle = String(item.trackName || "").toLowerCase();
-                const itArtist = String(item.artistName || "").toLowerCase();
-                if (itTitle === cleanTitle.toLowerCase() || itTitle === rawTitle.toLowerCase()) score += 45;
-                else if (itTitle.includes(cleanTitle.toLowerCase()) || cleanTitle.toLowerCase().includes(itTitle)) score += 22;
-                if (mainArtist && itArtist.includes(mainArtist.toLowerCase())) score += 35;
-                if (dur > 0 && item.duration) {
-                    const diff = Math.abs(Number(item.duration) - dur);
-                    if (diff <= 2) score += 35;
-                    else if (diff <= 5) score += 20;
-                    else if (diff <= 12) score += 8;
-                    else if (diff > 35) score -= 25;
-                }
-                return { item, score };
-            })
-            .sort((a, b) => b.score - a.score);
-
-        if (scored.length > 0 && scored[0].score >= 30) {
-            const top = scored[0].item;
-            if (top.syncedLyrics) {
-                const res = {
-                    synced: top.syncedLyrics || "",
-                    plain: top.plainLyrics || "",
-                    trackName: top.trackName || rawTitle,
-                    artistName: top.artistName || rawArtist,
-                    found: true,
-                };
-                lyricsCache.set(key, res);
-                return res;
-            }
-            if (!bestPlain) bestPlain = top;
+    const task = (async () => {
+        const params = new URLSearchParams({ artist_name: rawArtist, track_name: rawTitle });
+        if (dur > 0) params.set("duration", String(dur));
+        let exact = await httpsGetJson("https://lrclib.net/api/get?" + params.toString());
+        if (exact && (exact.syncedLyrics || exact.plainLyrics)) {
+            const res = {
+                synced: exact.syncedLyrics || "",
+                plain: exact.plainLyrics || "",
+                trackName: exact.trackName || rawTitle,
+                artistName: exact.artistName || rawArtist,
+                found: true,
+            };
+            setLyricsCached(key, res);
+            return res;
         }
-    }
 
-    if (bestPlain) {
-        const res = {
-            synced: "",
-            plain: bestPlain.plainLyrics || "",
-            trackName: bestPlain.trackName || rawTitle,
-            artistName: bestPlain.artistName || rawArtist,
-            found: true,
-        };
-        lyricsCache.set(key, res);
-        return res;
-    }
+        const cleanTitle = cleanTrackString(rawTitle) || rawTitle;
+        const mainArtist = primaryArtist(rawArtist);
+        const queries = [];
+        if (mainArtist) queries.push(mainArtist + " " + cleanTitle);
+        if (cleanTitle !== rawTitle && rawArtist) queries.push(rawArtist + " " + cleanTitle);
+        queries.push(cleanTitle);
 
-    const empty = { synced: "", plain: "", found: false };
-    lyricsCache.set(key, empty);
-    return empty;
+        const seenQueries = new Set();
+        let bestPlain = null;
+        for (const q of queries) {
+            const qNorm = q.trim().toLowerCase();
+            if (!qNorm || seenQueries.has(qNorm)) continue;
+            seenQueries.add(qNorm);
+
+            const list = await httpsGetJson("https://lrclib.net/api/search?q=" + encodeURIComponent(q.trim()));
+            if (!Array.isArray(list) || !list.length) continue;
+
+            const scored = list
+                .filter((item) => item && (item.syncedLyrics || item.plainLyrics))
+                .map((item) => {
+                    let score = 0;
+                    if (item.syncedLyrics) score += 60;
+                    if (item.plainLyrics) score += 10;
+                    const itTitle = String(item.trackName || "").toLowerCase();
+                    const itArtist = String(item.artistName || "").toLowerCase();
+                    if (itTitle === cleanTitle.toLowerCase() || itTitle === rawTitle.toLowerCase()) score += 45;
+                    else if (itTitle.includes(cleanTitle.toLowerCase()) || cleanTitle.toLowerCase().includes(itTitle)) score += 22;
+                    if (mainArtist && itArtist.includes(mainArtist.toLowerCase())) score += 35;
+                    if (dur > 0 && item.duration) {
+                        const diff = Math.abs(Number(item.duration) - dur);
+                        if (diff <= 2) score += 35;
+                        else if (diff <= 5) score += 20;
+                        else if (diff <= 12) score += 8;
+                        else if (diff > 35) score -= 25;
+                    }
+                    return { item, score };
+                })
+                .sort((a, b) => b.score - a.score);
+
+            if (scored.length > 0 && scored[0].score >= 30) {
+                const top = scored[0].item;
+                if (top.syncedLyrics) {
+                    const res = {
+                        synced: top.syncedLyrics || "",
+                        plain: top.plainLyrics || "",
+                        trackName: top.trackName || rawTitle,
+                        artistName: top.artistName || rawArtist,
+                        found: true,
+                    };
+                    setLyricsCached(key, res);
+                    return res;
+                }
+                if (!bestPlain) bestPlain = top;
+            }
+        }
+
+        if (bestPlain) {
+            const res = {
+                synced: "",
+                plain: bestPlain.plainLyrics || "",
+                trackName: bestPlain.trackName || rawTitle,
+                artistName: bestPlain.artistName || rawArtist,
+                found: true,
+            };
+            setLyricsCached(key, res);
+            return res;
+        }
+
+        const empty = { synced: "", plain: "", found: false };
+        setLyricsCached(key, empty);
+        return empty;
+    })().finally(() => {
+        if (lyricsInFlight.get(key) === task) lyricsInFlight.delete(key);
+    });
+
+    lyricsInFlight.set(key, task);
+    return task;
 }
 
 module.exports = {
@@ -1623,5 +1976,19 @@ module.exports = {
         getLinuxAppDisplayName,
         matchesLinuxAudioApp,
         scoreLinuxSession,
+        strictDetectImageMime,
+        isPrivateOrReservedIp,
+        isSafePublicArtUrl,
+        httpOrHttpsGetBuffer,
+        httpsGetJson,
+        httpsGetBuffer,
+        isValidMprisTarget,
+        isValidDbusObjectPath,
+        getLyricsCached,
+        setLyricsCached,
+        lyricsCache,
+        lyricsInFlight,
+        MAX_LYRICS_CACHE,
+        LYRICS_MISS_TTL_MS,
     },
 };

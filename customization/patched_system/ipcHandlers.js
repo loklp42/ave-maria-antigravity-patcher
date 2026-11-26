@@ -213,6 +213,9 @@ function registerIpcHandlers(storageManager, deps = {}) {
         return t.path;
     }
     localOnly('dialog:open-workspace', async (event) => {
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            throw new Error('Unauthorized dialog:open-workspace sender');
+        }
         const result = await electron_1.dialog.showOpenDialog({
             properties: ['openDirectory', 'createDirectory'],
             title: 'Open workspace',
@@ -256,6 +259,9 @@ function registerIpcHandlers(storageManager, deps = {}) {
     // Like 'dialog:open-workspace' but allows selecting multiple folders,
     // returning an array of paths (empty if cancelled).
     localOnly('dialog:open-workspaces', async (event) => {
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            throw new Error('Unauthorized dialog:open-workspaces sender');
+        }
         const result = await electron_1.dialog.showOpenDialog({
             properties: ['openDirectory', 'createDirectory', 'multiSelections'],
             title: 'Open workspaces',
@@ -479,9 +485,17 @@ function registerIpcHandlers(storageManager, deps = {}) {
             }
             return;
         }
-        customScheme_1.extensionAuthorities.clear();
-        for (const [key, value] of Object.entries(authorities)) {
-            customScheme_1.extensionAuthorities.set(key, value);
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            throw new Error('Unauthorized extensions:send-authorities sender');
+        }
+        if (typeof customScheme_1.setExtensionAuthoritiesForSession === 'function') {
+            customScheme_1.setExtensionAuthoritiesForSession(event?.sender?.session, authorities);
+        }
+        else {
+            customScheme_1.extensionAuthorities.clear();
+            for (const [key, value] of Object.entries(authorities || {})) {
+                customScheme_1.extensionAuthorities.set(key, value);
+            }
         }
     });
     // Agent
